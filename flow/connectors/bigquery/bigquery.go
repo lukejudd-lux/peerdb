@@ -435,6 +435,12 @@ func (c *BigQueryConnector) NormalizeRecords(ctx context.Context, req *model.Nor
 		unchangedToastMergeChunking = 8
 	}
 
+	geoMakeValid, err := internal.PeerDBBigQueryGeoMakeValid(ctx, req.Env)
+	if err != nil {
+		c.logger.Warn("failed to load PEERDB_BIGQUERY_GEO_MAKE_VALID, continuing with false", slog.Any("error", err))
+		geoMakeValid = false
+	}
+
 	rawTableName := c.getRawTableName(req.FlowJobName)
 
 	normBatchID, err := c.GetLastNormalizeBatchID(ctx, req.FlowJobName)
@@ -454,6 +460,7 @@ func (c *BigQueryConnector) NormalizeRecords(ctx context.Context, req *model.Nor
 		if err := c.mergeTablesInThisBatch(ctx, batchId,
 			req.FlowJobName, rawTableName, req.TableNameSchemaMapping, unchangedToastMergeChunking,
 			&protos.PeerDBColumns{SoftDeleteColName: req.SoftDeleteColName, SyncedAtColName: req.SyncedAtColName},
+			geoMakeValid,
 		); err != nil {
 			return model.NormalizeResponse{}, err
 		}
@@ -487,6 +494,7 @@ func (c *BigQueryConnector) mergeTablesInThisBatch(
 	tableToSchema map[string]*protos.TableSchema,
 	unchangedToastMergeChunking uint32,
 	peerdbColumns *protos.PeerDBColumns,
+	geoMakeValid bool,
 ) error {
 	tableNames, err := c.getDistinctTableNamesInBatch(
 		ctx,
@@ -517,6 +525,7 @@ func (c *BigQueryConnector) mergeTablesInThisBatch(
 		mergeBatchId:       batchId,
 		peerdbCols:         peerdbColumns,
 		shortColumn:        map[string]string{},
+		geoMakeValid:       geoMakeValid,
 	}
 
 	for _, tableName := range tableNames {
