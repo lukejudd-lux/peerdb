@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 
+	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/model"
 	"github.com/PeerDB-io/peerdb/flow/pkg/common"
 	"github.com/PeerDB-io/peerdb/flow/shared"
@@ -17,8 +18,6 @@ import (
 // TestInheritedTableWithExtraColumns verifies that CDC correctly handles child tables
 // that inherit from a parent but have additional columns beyond the parent's schema.
 //
-// This mirrors the real-world pattern where e.g. a "payment" parent table has 18 columns
-// and "stripe_payment" inherits all of them but adds "fk_stripe_payment" and "stripe_account_id".
 // Without the fix, the child's RelationMessage would be stored under the parent's relation ID,
 // causing cross-child contamination and positional column mismatches during tuple decoding.
 func TestInheritedTableWithExtraColumns(t *testing.T) {
@@ -291,4 +290,152 @@ func TestMultipleInheritedChildrenNoContamination(t *testing.T) {
 	// Verify both are routed to the parent table
 	require.Equal(t, tableName, stripeRec.SourceTableName)
 	require.Equal(t, tableName, paypalRec.SourceTableName)
+}
+
+// TestChildTableSchemaDeltaNotFalsePositive verifies that child-specific columns
+// are NOT treated as schema changes on the parent table.
+// Without the fix, a child's extra columns would be falsely detected as "added columns"
+// on the parent, triggering spurious ALTER TABLE statements on the destination.
+func TestChildTableSchemaDeltaNotFalsePositive(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	connector, schemaName := setupDB(t, "cdc_inherit_schema_delta")
+	defer connector.Close()
+	defer teardownDB(t, connector.conn, schemaName)
+
+	parentTable := common.QuoteIdentifier(schemaName) + ".payment"
+	stripeChild := common.QuoteIdentifier(schemaName) + ".stripe_payment"
+	promoChild := common.QuoteIdentifier(schemaName) + ".promo_payment"
+
+	_, err := connector.conn.Exec(ctx, fmt.Sprintf(`
+		CREATE TABLE %s (
+			id_payment UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			amount NUMERIC(12,2) NOT NULL,
+			status TEXT NOT NULL
+		);
+		CREATE TABLE %s (
+			fk_stripe_payment TEXT NOT NULL,
+			stripe_account_id TEXT NOT NULL
+		) INHERITS (%s);
+		CREATE TABLE %s (
+			fk_promo_payment TEXT NOT NULL
+		) INHERITS (%s);
+	`, parentTable, stripeChild, parentTable, promoChild, parentTable))
+	require.NoError(t, err)
+
+	var parentOID, stripeOID, promoOID uint32
+	for _, tbl := range []struct {
+		name string
+		oid  *uint32
+	}{
+		{"payment", &parentOID},
+		{"stripe_payment", &stripeOID},
+		{"promo_payment", &promoOID},
+	} {
+		err = connector.conn.QueryRow(ctx,
+			`SELECT c.oid FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
+			 WHERE n.nspname = $1 AND c.relname = $2`, schemaName, tbl.name).Scan(tbl.oid)
+		require.NoError(t, err)
+	}
+
+	tableName := schemaName + ".payment"
+	srcTableIDNameMapping := map[uint32]string{parentOID: tableName}
+	tableNameMapping := map[string]model.NameAndExclude{
+		tableName: {Name: "dest_payment", Exclude: nil},
+	}
+	tableNameSchemaMapping := map[string]*protos.TableSchema{
+		"dest_payment": {
+			Columns: []*protos.FieldDescription{
+				{Name: "id_payment", Type: string(types.QValueKindUUID)},
+				{Name: "amount", Type: string(types.QValueKindNumeric)},
+				{Name: "status", Type: string(types.QValueKindString)},
+			},
+			System: protos.TypeSystem_Q,
+		},
+	}
+
+	cdc, err := connector.NewPostgresCDCSource(ctx, &PostgresCDCConfig{
+		SrcTableIDNameMapping:                    srcTableIDNameMapping,
+		TableNameMapping:                         tableNameMapping,
+		TableNameSchemaMapping:                   tableNameSchemaMapping,
+		RelationMessageMapping:                   connector.relationMessageMapping,
+		FlowJobName:                              "test_flow",
+		Slot:                                     "test_slot",
+		Publication:                              "test_pub",
+		HandleInheritanceForNonPartitionedTables: true,
+		InternalVersion:                          shared.InternalVersion_Latest,
+	})
+	require.NoError(t, err)
+
+	// --- Case 1: Child table with extra columns must NOT produce a schema delta ---
+	// stripe_payment has fk_stripe_payment and stripe_account_id beyond the parent's columns.
+	// These exist on the child but NOT in pg_attribute for the parent, so they must be filtered out.
+	stripeRelMsg := &pglogrepl.RelationMessage{
+		RelationID: stripeOID,
+		Columns: []*pglogrepl.RelationMessageColumn{
+			{Name: "id_payment", DataType: pgtype.UUIDOID, TypeModifier: -1},
+			{Name: "amount", DataType: pgtype.NumericOID, TypeModifier: -1},
+			{Name: "status", DataType: pgtype.TextOID, TypeModifier: -1},
+			{Name: "fk_stripe_payment", DataType: pgtype.TextOID, TypeModifier: -1},
+			{Name: "stripe_account_id", DataType: pgtype.TextOID, TypeModifier: -1},
+		},
+	}
+
+	rec, err := processRelationMessage[model.RecordItems](ctx, cdc, pglogrepl.LSN(1), stripeRelMsg)
+	require.NoError(t, err)
+	require.Nil(t, rec, "child-specific columns must not produce a schema delta")
+
+	// The child's relation should be stored for tuple decoding
+	_, stored := connector.relationMessageMapping[stripeOID]
+	require.True(t, stored, "child relation must be stored after processing")
+
+	// --- Case 2: Different child with different extra columns also must NOT produce a delta ---
+	promoRelMsg := &pglogrepl.RelationMessage{
+		RelationID: promoOID,
+		Columns: []*pglogrepl.RelationMessageColumn{
+			{Name: "id_payment", DataType: pgtype.UUIDOID, TypeModifier: -1},
+			{Name: "amount", DataType: pgtype.NumericOID, TypeModifier: -1},
+			{Name: "status", DataType: pgtype.TextOID, TypeModifier: -1},
+			{Name: "fk_promo_payment", DataType: pgtype.TextOID, TypeModifier: -1},
+		},
+	}
+
+	rec, err = processRelationMessage[model.RecordItems](ctx, cdc, pglogrepl.LSN(2), promoRelMsg)
+	require.NoError(t, err)
+	require.Nil(t, rec, "promo child-specific columns must not produce a schema delta")
+
+	// --- Case 3: Repeated relation with same child columns must NOT produce a delta ---
+	rec, err = processRelationMessage[model.RecordItems](ctx, cdc, pglogrepl.LSN(3), stripeRelMsg)
+	require.NoError(t, err)
+	require.Nil(t, rec, "repeated child relation must not produce a schema delta")
+
+	// --- Case 4: Genuine ALTER TABLE on the parent must still be detected via child ---
+	// Actually add the column to the parent table in Postgres so pg_attribute reflects it.
+	_, err = connector.conn.Exec(ctx, fmt.Sprintf(
+		`ALTER TABLE %s ADD COLUMN metadata TEXT`, parentTable))
+	require.NoError(t, err)
+
+	// The child's RELATION now includes "metadata" (inherited from parent ALTER).
+	stripeRelMsgWithNew := &pglogrepl.RelationMessage{
+		RelationID: stripeOID,
+		Columns: []*pglogrepl.RelationMessageColumn{
+			{Name: "id_payment", DataType: pgtype.UUIDOID, TypeModifier: -1},
+			{Name: "amount", DataType: pgtype.NumericOID, TypeModifier: -1},
+			{Name: "status", DataType: pgtype.TextOID, TypeModifier: -1},
+			{Name: "fk_stripe_payment", DataType: pgtype.TextOID, TypeModifier: -1},
+			{Name: "stripe_account_id", DataType: pgtype.TextOID, TypeModifier: -1},
+			{Name: "metadata", DataType: pgtype.TextOID, TypeModifier: -1},
+		},
+	}
+
+	rec, err = processRelationMessage[model.RecordItems](ctx, cdc, pglogrepl.LSN(4), stripeRelMsgWithNew)
+	require.NoError(t, err)
+	require.NotNil(t, rec, "genuinely new parent column must produce a schema delta")
+
+	relRec, ok := rec.(*model.RelationRecord[model.RecordItems])
+	require.True(t, ok)
+	require.Len(t, relRec.TableSchemaDelta.AddedColumns, 1,
+		"only the genuinely new column should appear, not child-specific columns")
+	require.Equal(t, "metadata", relRec.TableSchemaDelta.AddedColumns[0].Name)
 }

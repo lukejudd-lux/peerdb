@@ -1117,6 +1117,30 @@ func processRelationMessage[Items model.Items](
 			slog.Uint64("relId", uint64(currRel.RelationID)))
 		return nil, nil
 	}
+
+	// For child tables (partitioned/inherited), query the parent's actual columns
+	// to distinguish child-specific columns from genuinely new parent columns.
+	// Without this, columns unique to a child table are falsely detected as schema
+	// changes on the parent, triggering spurious ALTER TABLE statements on the destination.
+	isChildTable := currRel.RelationID != effectiveRelID
+	var parentColumnSet map[string]struct{}
+	if isChildTable {
+		parentRows, err := p.conn.Query(ctx,
+			"select attname from pg_attribute where attrelid=$1 and attnum > 0 and not attisdropped",
+			effectiveRelID)
+		if err != nil {
+			return nil, fmt.Errorf("error querying parent table columns for schema delta: %w", err)
+		}
+		parentColumns, err := pgx.CollectRows[string](parentRows, pgx.RowTo)
+		if err != nil {
+			return nil, fmt.Errorf("error collecting parent table columns for schema delta: %w", err)
+		}
+		parentColumnSet = make(map[string]struct{}, len(parentColumns))
+		for _, name := range parentColumns {
+			parentColumnSet[name] = struct{}{}
+		}
+	}
+
 	customTypeMapping, err := p.fetchCustomTypeMapping(ctx)
 	if err != nil {
 		return nil, err
@@ -1177,6 +1201,13 @@ func processRelationMessage[Items model.Items](
 		_, inPrevRel := prevRelMap[columnName]
 		if inPrevRel {
 			return false
+		}
+		// For child tables, only propagate columns that actually exist on the parent table.
+		// Columns unique to the child should not trigger schema deltas.
+		if parentColumnSet != nil {
+			if _, onParent := parentColumnSet[columnName]; !onParent {
+				return false
+			}
 		}
 		_, isExcluded := p.tableNameMapping[p.srcTableIDNameMapping[effectiveRelID]].Exclude[columnName]
 		return !isExcluded
