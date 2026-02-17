@@ -182,12 +182,12 @@ func TestMultipleInheritedChildrenNoContamination(t *testing.T) {
 
 	var parentOID, stripeOID, paypalOID uint32
 	for _, tbl := range []struct {
-		name string
 		oid  *uint32
+		name string
 	}{
-		{"payment", &parentOID},
-		{"stripe_payment", &stripeOID},
-		{"paypal_payment", &paypalOID},
+		{&parentOID, "payment"},
+		{&stripeOID, "stripe_payment"},
+		{&paypalOID, "paypal_payment"},
 	} {
 		err = connector.conn.QueryRow(ctx,
 			`SELECT c.oid FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
@@ -326,12 +326,12 @@ func TestChildTableSchemaDeltaNotFalsePositive(t *testing.T) {
 
 	var parentOID, stripeOID, promoOID uint32
 	for _, tbl := range []struct {
-		name string
 		oid  *uint32
+		name string
 	}{
-		{"payment", &parentOID},
-		{"stripe_payment", &stripeOID},
-		{"promo_payment", &promoOID},
+		{&parentOID, "payment"},
+		{&stripeOID, "stripe_payment"},
+		{&promoOID, "promo_payment"},
 	} {
 		err = connector.conn.QueryRow(ctx,
 			`SELECT c.oid FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid
