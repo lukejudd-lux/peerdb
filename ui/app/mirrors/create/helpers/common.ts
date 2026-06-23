@@ -89,6 +89,7 @@ export const blankQRepSetting: QRepConfig = {
   parentMirrorName: '',
   exclude: [],
   columns: [],
+  jsonPassthroughColumns: [],
   sourceType: DBType.DBTYPE_UNKNOWN,
   flags: [],
 };

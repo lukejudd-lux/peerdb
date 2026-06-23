@@ -196,6 +196,7 @@ function reformattedTableMapping(tableMapping: TableMapRow[]): TableMapping[] {
       bigqueryCdcEventsFunction:
         BigqueryCdcEventsFunction.BIGQUERY_CDC_EVENTS_FUNCTION_APPENDS,
       queryCdcWatermarkColumn: row.queryCdcWatermarkColumn,
+      jsonPassthroughColumns: [],
     }));
 }
 
@@ -233,6 +234,7 @@ export function changesToTablesMapping(
           shardingKey: row.shardingKey,
           policyName: row.policyName,
           partitionByExpr: row.partitionByExpr,
+          jsonPassthroughColumns: [],
         }) as TableMapping
     );
   return mapping;
