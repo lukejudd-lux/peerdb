@@ -30,6 +30,12 @@ import (
 
 const (
 	SyncRecordsBatchSize = 1024
+
+	// schemaDeltaDDLTimeout bounds each ALTER TABLE issued during schema delta
+	// replay so that a persistently retrying BigQuery job (e.g. hitting the
+	// table metadata update rate limit) fails fast instead of blocking the
+	// sync activity indefinitely.
+	schemaDeltaDDLTimeout = 2 * time.Minute
 )
 
 func NewBigQueryServiceAccount(bqConfig *protos.BigqueryConfig) (*utils.GcpServiceAccount, error) {
@@ -247,41 +253,58 @@ func (c *BigQueryConnector) ReplayTableSchemaDeltas(
 			continue
 		}
 
-	AddedColumnsLoop:
+		dstDatasetTable, err := c.convertToDatasetTable(schemaDelta.DstTableName)
+		if err != nil {
+			return err
+		}
+
+		table := c.client.DatasetInProject(c.projectID, dstDatasetTable.dataset).Table(dstDatasetTable.table)
+		dstMetadata, metadataErr := table.Metadata(ctx)
+		if metadataErr != nil {
+			return fmt.Errorf("failed to get metadata for table %s: %w", schemaDelta.DstTableName, metadataErr)
+		}
+		existingColumns := make(map[string]struct{}, len(dstMetadata.Schema))
+		for _, field := range dstMetadata.Schema {
+			existingColumns[field.Name] = struct{}{}
+		}
+
+		addColumnClauses := make([]string, 0, len(schemaDelta.AddedColumns))
+		addedColumnNames := make([]string, 0, len(schemaDelta.AddedColumns))
 		for _, addedColumn := range schemaDelta.AddedColumns {
-			dstDatasetTable, err := c.convertToDatasetTable(schemaDelta.DstTableName)
-			if err != nil {
-				return err
-			}
-
-			table := c.client.DatasetInProject(c.projectID, dstDatasetTable.dataset).Table(dstDatasetTable.table)
-			dstMetadata, metadataErr := table.Metadata(ctx)
-			if metadataErr != nil {
-				return fmt.Errorf("failed to get metadata for table %s: %w", schemaDelta.DstTableName, metadataErr)
-			}
-
-			// check if the column already exists
-			for _, field := range dstMetadata.Schema {
-				if field.Name == addedColumn.Name {
-					c.logger.Info(fmt.Sprintf("[schema delta replay] column %s already exists in table %s",
-						addedColumn.Name, schemaDelta.DstTableName))
-					continue AddedColumnsLoop
-				}
+			if _, exists := existingColumns[addedColumn.Name]; exists {
+				c.logger.Info(fmt.Sprintf("[schema delta replay] column %s already exists in table %s",
+					addedColumn.Name, schemaDelta.DstTableName))
+				continue
 			}
 
 			addedColumnBigQueryType := qValueKindToBigQueryTypeString(addedColumn, schemaDelta.NullableEnabled, false)
-			query := c.queryWithLogging(fmt.Sprintf(
-				"ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `%s` %s",
-				dstDatasetTable.table, addedColumn.Name, addedColumnBigQueryType))
-			query.DefaultProjectID = c.projectID
-			query.DefaultDatasetID = dstDatasetTable.dataset
-			if _, err := query.Read(ctx); err != nil {
-				return fmt.Errorf("failed to add column %s for table %s: %w", addedColumn.Name,
-					schemaDelta.DstTableName, err)
-			}
-			c.logger.Info(fmt.Sprintf("[schema delta replay] added column %s with data type %s to table %s",
-				addedColumn.Name, addedColumnBigQueryType, schemaDelta.DstTableName))
+			addColumnClauses = append(addColumnClauses, fmt.Sprintf("ADD COLUMN IF NOT EXISTS `%s` %s",
+				addedColumn.Name, addedColumnBigQueryType))
+			addedColumnNames = append(addedColumnNames, addedColumn.Name)
 		}
+
+		if len(addColumnClauses) == 0 {
+			continue
+		}
+
+		// Issue a single ALTER TABLE with all added columns instead of one DDL job
+		// per column: BigQuery enforces a low rate limit on table metadata update
+		// operations, and a schema change with several new columns can otherwise
+		// trip that limit.
+		query := c.queryWithLogging(fmt.Sprintf(
+			"ALTER TABLE `%s` %s", dstDatasetTable.table, strings.Join(addColumnClauses, ", ")))
+		query.DefaultProjectID = c.projectID
+		query.DefaultDatasetID = dstDatasetTable.dataset
+
+		ddlCtx, cancel := context.WithTimeout(ctx, schemaDeltaDDLTimeout)
+		_, err = query.Read(ddlCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("failed to add columns %v for table %s: %w", addedColumnNames,
+				schemaDelta.DstTableName, err)
+		}
+		c.logger.Info(fmt.Sprintf("[schema delta replay] added columns %v to table %s",
+			addedColumnNames, schemaDelta.DstTableName))
 	}
 
 	return nil
