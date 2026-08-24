@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,7 +18,19 @@ import (
 	"github.com/PeerDB-io/peerdb/flow/shared/exceptions"
 )
 
-const SSHKeepaliveInterval = 15 * time.Second
+const (
+	SSHKeepaliveInterval = 15 * time.Second
+	// Consecutive unanswered keepalive ticks before the tunnel is marked dead.
+	// One delayed reply is treated as lag, not failure, to avoid reconnect storms.
+	SSHKeepaliveMaxStrikes  = 3
+	SSHKeepaliveHungTimeout = (SSHKeepaliveMaxStrikes + 2) * SSHKeepaliveInterval
+)
+
+type keepaliveOptions struct {
+	interval   time.Duration
+	maxStrikes int
+	send       func() error
+}
 
 type SSHTunnel struct {
 	*ssh.Client
@@ -117,68 +130,89 @@ func (tunnel *SSHTunnel) DialContext(ctx context.Context, network, address strin
 
 func (tunnel *SSHTunnel) Close() error {
 	if tunnel != nil && tunnel.Client != nil {
-		if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
-			close(*keepaliveChan)
-		}
-		tunnel.badTunnel.Store(true)
+		tunnel.markTunnelBad(nil)
 		return tunnel.Client.Close()
 	}
 	return nil
 }
 
+func (tunnel *SSHTunnel) closeKeepaliveChan() {
+	if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
+		close(*keepaliveChan)
+	}
+}
+
+func (tunnel *SSHTunnel) markTunnelBad(onFailure func()) {
+	tunnel.closeKeepaliveChan()
+	tunnel.badTunnel.Store(true)
+	if onFailure != nil {
+		onFailure()
+	}
+}
+
 func (tunnel *SSHTunnel) runKeepaliveLoop(
 	ctx context.Context, stopChan <-chan struct{}, onFailure func(),
 ) {
-	ticker := time.NewTicker(SSHKeepaliveInterval)
+	tunnel.runKeepaliveLoopWith(ctx, stopChan, onFailure, keepaliveOptions{
+		interval:   SSHKeepaliveInterval,
+		maxStrikes: SSHKeepaliveMaxStrikes,
+		send: func() error {
+			_, _, err := tunnel.Client.SendRequest("keepalive@openssh.com", true, nil)
+			return err
+		},
+	})
+}
+
+func (tunnel *SSHTunnel) runKeepaliveLoopWith(
+	ctx context.Context, stopChan <-chan struct{}, onFailure func(), opts keepaliveOptions,
+) {
+	ticker := time.NewTicker(opts.interval)
 	defer ticker.Stop()
 	logger := tunnel.logger
-	// in case request hangs, we want to detect that and not send another request
 	requestSent := atomic.Bool{}
+	var strikes atomic.Int32
 	var keepaliveErr error
-	// closed by request making goroutine to signal error, keepaliveErr
 	errChan := make(chan struct{})
+	var errOnce sync.Once
 
 	for {
 		select {
 		case <-ticker.C:
 			if requestSent.Load() {
-				// Previous keepalive request didn't return yet, something's wrong
-				logger.ErrorContext(ctx, "Previous keepalive request still pending, marking tunnel as bad")
-				if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
-					close(*keepaliveChan)
+				n := strikes.Add(1)
+				if int(n) < opts.maxStrikes {
+					logger.WarnContext(ctx, "Keepalive request still pending",
+						slog.Int("strikes", int(n)),
+						slog.Int("maxStrikes", opts.maxStrikes),
+					)
+					continue
 				}
-				tunnel.badTunnel.Store(true)
-				if onFailure != nil {
-					onFailure()
-				}
+				logger.ErrorContext(ctx, "Keepalive request still pending, marking tunnel as bad",
+					slog.Int("strikes", int(n)),
+					slog.Int("maxStrikes", opts.maxStrikes),
+				)
+				tunnel.markTunnelBad(onFailure)
 				return
 			}
+			requestSent.Store(true)
 			go func() {
-				requestSent.Store(true)
-				_, _, err := tunnel.Client.SendRequest("keepalive@openssh.com", true, nil)
-				requestSent.Store(false)
+				err := opts.send()
 				if err != nil {
 					keepaliveErr = err
-					close(errChan)
+					errOnce.Do(func() { close(errChan) })
+					return
 				}
+				requestSent.Store(false)
+				strikes.Store(0)
 			}()
 		case <-ctx.Done():
-			if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
-				close(*keepaliveChan)
-			}
+			tunnel.closeKeepaliveChan()
 			return
 		case <-stopChan:
-			// channel closed from outside
 			return
 		case <-errChan:
 			logger.ErrorContext(ctx, "Keepalive request failed, marking tunnel as bad", slog.Any("error", keepaliveErr))
-			if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
-				close(*keepaliveChan)
-			}
-			tunnel.badTunnel.Store(true)
-			if onFailure != nil {
-				onFailure()
-			}
+			tunnel.markTunnelBad(onFailure)
 			return
 		}
 	}
