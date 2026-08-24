@@ -20,10 +20,16 @@ import (
 
 const (
 	SSHKeepaliveInterval = 15 * time.Second
-	// Consecutive unanswered keepalive ticks before the tunnel is marked dead.
-	// One delayed reply is treated as lag, not failure, to avoid reconnect storms.
+	// OpenSSH ClientAliveCountMax default. The jump host (Ubuntu sshd) does not set
+	// ClientAliveInterval, so a single delayed reply is lag, not a dead tunnel.
 	SSHKeepaliveMaxStrikes  = 3
 	SSHKeepaliveHungTimeout = (SSHKeepaliveMaxStrikes + 2) * SSHKeepaliveInterval
+
+	// sshd LoginGraceTime is 120s. Bound handshake so a hung kex cannot occupy a
+	// MaxStartups slot (bastion is 50:30:200, shared with Fivetran) until then.
+	SSHDialTimeout = 30 * time.Second
+	// sshd TCPKeepAlive is yes; probe faster than the kernel 2h default.
+	SSHTCPKeepaliveInterval = 30 * time.Second
 )
 
 type keepaliveOptions struct {
@@ -83,6 +89,7 @@ func GetSSHClientConfig(config *protos.SSHConfig) (*ssh.ClientConfig, error) {
 		User:            config.User,
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
+		Timeout:         SSHDialTimeout,
 	}, nil
 }
 
@@ -100,7 +107,7 @@ func NewSSHTunnel(
 		}
 
 		logger.Info("Setting up SSH connection", slog.String("Server", sshServer))
-		client, err := ssh.Dial("tcp", sshServer, clientConfig)
+		client, err := dialSSH(ctx, sshServer, clientConfig)
 		if err != nil {
 			return nil, exceptions.NewSSHTunnelSetupError(err)
 		}
@@ -112,6 +119,35 @@ func NewSSHTunnel(
 	}
 
 	return nil, nil
+}
+
+func dialSSH(ctx context.Context, addr string, clientConfig *ssh.ClientConfig) (*ssh.Client, error) {
+	dialer := &net.Dialer{
+		Timeout:   SSHDialTimeout,
+		KeepAlive: SSHTCPKeepaliveInterval,
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			_ = conn.Close()
+			return nil, ctx.Err()
+		}
+		cfg := *clientConfig
+		if cfg.Timeout == 0 || remaining < cfg.Timeout {
+			cfg.Timeout = remaining
+		}
+		clientConfig = &cfg
+	}
+	clientConn, chans, reqs, err := ssh.NewClientConn(conn, addr, clientConfig)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return ssh.NewClient(clientConn, chans, reqs), nil
 }
 
 // IsBad reports whether the tunnel has been marked unusable (keepalive failure or explicit close).
