@@ -6,6 +6,9 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
+	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +37,81 @@ func TestCachedSigner_ParsesOnceAndReuses(t *testing.T) {
 	cfg, err := GetSSHClientConfig(&protos.SSHConfig{User: "testuser", PrivateKey: b64})
 	require.NoError(t, err)
 	require.Len(t, cfg.Auth, 1, "private key config should yield one auth method")
+}
+
+func startTestKeepaliveLoop(
+	t *testing.T, interval time.Duration, maxStrikes int, send func() error, onFailure func(),
+) *SSHTunnel {
+	t.Helper()
+	tunnel := &SSHTunnel{logger: slog.New(slog.DiscardHandler)}
+	stopChan := make(chan struct{})
+	tunnel.keepaliveChan.Store(&stopChan)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	go tunnel.runKeepaliveLoopWith(ctx, stopChan, onFailure, keepaliveOptions{
+		interval:   interval,
+		maxStrikes: maxStrikes,
+		send:       send,
+	})
+	return tunnel
+}
+
+func TestKeepaliveSingleDelayedReplyDoesNotFailTunnel(t *testing.T) {
+	t.Parallel()
+	interval := 25 * time.Millisecond
+	var calls atomic.Int32
+	send := func() error {
+		if calls.Add(1) == 1 {
+			time.Sleep(3 * interval / 2)
+		}
+		return nil
+	}
+
+	failed := make(chan struct{})
+	tunnel := startTestKeepaliveLoop(t, interval, SSHKeepaliveMaxStrikes, send, func() {
+		close(failed)
+	})
+
+	select {
+	case <-failed:
+		t.Fatal("a single delayed keepalive reply should not mark the tunnel bad")
+	case <-time.After(8 * interval):
+	}
+	require.False(t, tunnel.IsBad())
+	require.GreaterOrEqual(t, calls.Load(), int32(2))
+}
+
+func TestKeepaliveHungRequestFailsAfterMaxStrikes(t *testing.T) {
+	t.Parallel()
+	interval := 20 * time.Millisecond
+	failed := make(chan struct{})
+	tunnel := startTestKeepaliveLoop(t, interval, SSHKeepaliveMaxStrikes, func() error {
+		<-t.Context().Done()
+		return t.Context().Err()
+	}, func() { close(failed) })
+
+	select {
+	case <-failed:
+	case <-time.After(time.Duration(SSHKeepaliveMaxStrikes+3) * interval):
+		t.Fatal("hung keepalive should mark the tunnel bad after consecutive strikes")
+	}
+	require.True(t, tunnel.IsBad())
+}
+
+func TestKeepaliveHardErrorFailsImmediately(t *testing.T) {
+	t.Parallel()
+	interval := 20 * time.Millisecond
+	failed := make(chan struct{})
+	tunnel := startTestKeepaliveLoop(t, interval, SSHKeepaliveMaxStrikes, func() error {
+		return errors.New("connection reset")
+	}, func() { close(failed) })
+
+	select {
+	case <-failed:
+	case <-time.After(3 * interval):
+		t.Fatal("a keepalive send error should mark the tunnel bad without waiting for strikes")
+	}
+	require.True(t, tunnel.IsBad())
 }
 
 func TestSSHTunnel_GetKeepaliveChan_NilCases(t *testing.T) {

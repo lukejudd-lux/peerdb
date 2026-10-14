@@ -217,7 +217,7 @@ func TestMySQLOnlyIntegrationSSHKeepaliveCDCHang(t *testing.T) {
 		t.Log("SSH keepalive detected failure")
 	case <-pullDone.Chan():
 		t.Fatal("PullRecords exited before SSH keepalive fired — connection closed by something other than keepalive")
-	case <-time.After(3 * utils.SSHKeepaliveInterval):
+	case <-time.After(utils.SSHKeepaliveHungTimeout):
 		t.Fatal("SSH keepalive did not fire in time")
 	}
 
@@ -267,14 +267,14 @@ func TestMySQLOnlyIntegrationSSHKeepaliveCDCCloseHang(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	t.Logf("Waiting for context cancel (~5s), then PullRecords should hang until keepalive fires (within %s)", 3*utils.SSHKeepaliveInterval)
+	t.Logf("Waiting for context cancel (~5s), then PullRecords should hang until keepalive fires (within %s)", utils.SSHKeepaliveHungTimeout)
 
 	// Wait for keepalive to detect the failure — PullRecords should be hanging
 	// until keepalive closes the underlying connection
 	select {
 	case <-keepaliveChan:
 		t.Log("SSH keepalive detected failure")
-	case <-time.After(3 * utils.SSHKeepaliveInterval):
+	case <-time.After(utils.SSHKeepaliveHungTimeout):
 		t.Fatal("SSH keepalive did not fire in time")
 	}
 
