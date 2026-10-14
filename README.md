@@ -11,6 +11,17 @@
 
 </div>
 
+## About this fork
+
+This is [lux-group](https://github.com/lux-group)'s fork of [PeerDB](https://github.com/PeerDB-io/peerdb), maintained for our Postgres → BigQuery streaming. It tracks upstream and adds the changes we need that upstream doesn't carry — chiefly keeping the **BigQuery destination** first-class (upstream has [deprecated it](docs/deprecated-connectors.md)) and cutting the CPU and allocation cost of the CDC path.
+
+Major changes vs upstream:
+
+- **BigQuery destination kept and tuned** — upstream deprecated BigQuery as a destination; we keep it maintained and faster. JSON passthrough is on by default ([#3](https://github.com/lukejudd-lux/peerdb/pull/3)), and redundant old-row serialization is skipped on updates ([#4](https://github.com/lukejudd-lux/peerdb/pull/4)).
+- **Leaner CDC pull path** — `_peerdb_data` is streamed as JSON instead of building an intermediate map ([#5](https://github.com/lukejudd-lux/peerdb/pull/5)), parsed SSH signers are cached instead of re-parsed per connection ([#6](https://github.com/lukejudd-lux/peerdb/pull/6)), and per-record allocations in the pull loop are trimmed ([upstream #4920](https://github.com/PeerDB-io/peerdb/pull/4920)). Together these cut flow-worker CPU ~13% in production at equal load.
+- **Per-replica metrics** — OTel `service.instance.id` is set per pod so multiple flow-worker replicas no longer collapse into a single metric series ([#2](https://github.com/lukejudd-lux/peerdb/pull/2)).
+- **SSH tunnel stability** — a tunnel is only torn down after consecutive keepalive misses, to ride out transient network blips ([#1](https://github.com/lukejudd-lux/peerdb/pull/1)).
+
 ## PeerDB
 
 At PeerDB, we are building a fast, simple and the most cost effective way to stream data from Postgres to Data Warehouses, Queues and Storage engines. If you are running Postgres at the heart of your data-stack and move data at scale from Postgres to any of the above targets, PeerDB can provide value.
