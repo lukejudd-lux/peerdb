@@ -73,6 +73,11 @@ type PostgresCDCSource struct {
 	jsonPassthroughDefault                   bool
 	internalVersion                          uint32
 	warnedTypeChanges                        sync.Map
+	// debugEnabled is computed once so the per-record/per-message Debug calls below
+	// can be skipped entirely when debug logging is off. The temporal log.Logger
+	// builds its keyval slice before the level is checked, so an unguarded Debug on
+	// the hot path allocates on every record even when nothing is emitted.
+	debugEnabled bool
 }
 
 type PostgresCDCConfig struct {
@@ -197,6 +202,7 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		originMetadataAsDestinationColumn:        cdcConfig.OriginMetaAsDestinationColumn,
 		jsonPassthroughDefault:                   cdcConfig.JSONPassthroughDefault,
 		internalVersion:                          cdcConfig.InternalVersion,
+		debugEnabled:                             slog.Default().Enabled(ctx, slog.LevelDebug),
 	}, nil
 }
 
@@ -684,11 +690,13 @@ func PullCdcRecords[Items model.Items](
 		messageWaitPeriod = min(req.IdleTimeout, clientSidePingPeriod(p.walSenderTimeout.duration))
 	}
 
-	logger.Debug("Message wait period determined",
-		slog.Duration("messageWaitPeriod", messageWaitPeriod),
-		slog.Duration("wal_sender_timeout", p.walSenderTimeout.duration),
-		slog.Duration("req.IdleTimeout", req.IdleTimeout),
-	)
+	if p.debugEnabled {
+		logger.Debug("Message wait period determined",
+			slog.Duration("messageWaitPeriod", messageWaitPeriod),
+			slog.Duration("wal_sender_timeout", p.walSenderTimeout.duration),
+			slog.Duration("req.IdleTimeout", req.IdleTimeout),
+		)
+	}
 
 	records := req.RecordStream
 	warnedReplIdentTables := make(map[string]struct{})
@@ -978,8 +986,10 @@ func PullCdcRecords[Items model.Items](
 					lastXLogDataServerWALEnd.Store(int64(xld.ServerWALEnd))
 				}
 
-				logger.Debug("XLogData",
-					slog.Any("WALStart", xld.WALStart), slog.Any("ServerWALEnd", xld.ServerWALEnd), slog.Time("ServerTime", xld.ServerTime))
+				if p.debugEnabled {
+					logger.Debug("XLogData",
+						slog.Any("WALStart", xld.WALStart), slog.Any("ServerWALEnd", xld.ServerWALEnd), slog.Time("ServerTime", xld.ServerTime))
+				}
 				rec, err := processMessage(ctx, p, records, xld, clientXLogPos, postgresClockOffset,
 					processor, warnedReplIdentTables, logger)
 				if err != nil {
@@ -1181,7 +1191,9 @@ func processMessage[Items model.Items](
 
 	switch msg := logicalMsg.(type) {
 	case *pglogrepl.BeginMessage:
-		logger.Debug("BeginMessage", slog.Any("FinalLSN", msg.FinalLSN), slog.Uint64("XID", uint64(msg.Xid)))
+		if p.debugEnabled {
+			logger.Debug("BeginMessage", slog.Any("FinalLSN", msg.FinalLSN), slog.Uint64("XID", uint64(msg.Xid)))
+		}
 		p.otelManager.Metrics.SourceLagGauge.Record(ctx,
 			time.Now().UTC().Add(postgresClockOffset).Sub(msg.CommitTime).Milliseconds())
 		p.commitLock = msg
@@ -1193,9 +1205,11 @@ func processMessage[Items model.Items](
 		return processDeleteMessage(p, xld.WALStart, msg, processor, customTypeMapping)
 	case *pglogrepl.CommitMessage:
 		// for a commit message, update the last checkpoint id for the record batch.
-		logger.Debug("CommitMessage",
-			slog.Any("CommitLSN", msg.CommitLSN),
-			slog.Any("TransactionEndLSN", msg.TransactionEndLSN))
+		if p.debugEnabled {
+			logger.Debug("CommitMessage",
+				slog.Any("CommitLSN", msg.CommitLSN),
+				slog.Any("TransactionEndLSN", msg.TransactionEndLSN))
+		}
 		batch.UpdateLatestCheckpointID(int64(msg.CommitLSN))
 		p.otelManager.Metrics.ReceivedCommitLSNGauge.Record(ctx, int64(msg.CommitLSN))
 		p.otelManager.Metrics.SourceLagGauge.Record(ctx,
@@ -1231,10 +1245,12 @@ func processMessage[Items model.Items](
 
 		return processRelationMessage[Items](ctx, p, currentClientXlogPos, msg)
 	case *pglogrepl.LogicalDecodingMessage:
-		logger.Debug("LogicalDecodingMessage",
-			slog.Bool("Transactional", msg.Transactional),
-			slog.String("Prefix", msg.Prefix),
-			slog.String("LSN", msg.LSN.String()))
+		if p.debugEnabled {
+			logger.Debug("LogicalDecodingMessage",
+				slog.Bool("Transactional", msg.Transactional),
+				slog.String("Prefix", msg.Prefix),
+				slog.String("LSN", msg.LSN.String()))
+		}
 		if !msg.Transactional {
 			batch.UpdateLatestCheckpointID(int64(msg.LSN))
 		}
@@ -1268,7 +1284,9 @@ func processInsertMessage[Items model.Items](
 	}
 
 	// log lsn and relation id for debugging
-	p.logger.Debug("InsertMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	if p.debugEnabled {
+		p.logger.Debug("InsertMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	}
 
 	rel, ok := p.relationMessageMapping[relID]
 	if !ok {
@@ -1311,7 +1329,9 @@ func processUpdateMessage[Items model.Items](
 	}
 
 	// log lsn and relation id for debugging
-	p.logger.Debug("UpdateMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	if p.debugEnabled {
+		p.logger.Debug("UpdateMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	}
 
 	// By default, replica identity is the same as source PK/destination ordering key,
 	// so when it changes the destination can see duplicates or missed deletes.
@@ -1388,7 +1408,9 @@ func processDeleteMessage[Items model.Items](
 	}
 
 	// log lsn and relation id for debugging
-	p.logger.Debug("DeleteMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	if p.debugEnabled {
+		p.logger.Debug("DeleteMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	}
 
 	rel, ok := p.relationMessageMapping[relID]
 	if !ok {
