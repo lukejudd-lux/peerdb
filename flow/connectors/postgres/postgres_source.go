@@ -333,6 +333,10 @@ func pullCore[Items model.Items](
 	if err != nil {
 		return fmt.Errorf("failed to get get setting for originMetaAsDestinationColumn: %w", err)
 	}
+	jsonPassthroughDefault, err := internal.PeerDBBigQueryJSONPassthrough(ctx, req.Env)
+	if err != nil {
+		return fmt.Errorf("failed to get setting for jsonPassthroughDefault: %w", err)
+	}
 
 	cdc, err := c.NewPostgresCDCSource(ctx, &PostgresCDCConfig{
 		CatalogPool:                              catalogPool,
@@ -347,6 +351,7 @@ func pullCore[Items model.Items](
 		HandleInheritanceForNonPartitionedTables: handleInheritanceForNonPartitionedTables,
 		SourceSchemaAsDestinationColumn:          sourceSchemaAsDestinationColumn,
 		OriginMetaAsDestinationColumn:            originMetaAsDestinationColumn,
+		JSONPassthroughDefault:                   jsonPassthroughDefault,
 		DestinationType:                          req.DestinationType,
 		InternalVersion:                          req.InternalVersion,
 	})
