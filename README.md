@@ -20,7 +20,7 @@ Major changes vs upstream:
 - **BigQuery destination kept and tuned** — upstream deprecated BigQuery as a destination; we keep it maintained and faster. JSON passthrough is on by default ([#3](https://github.com/lukejudd-lux/peerdb/pull/3)), and redundant old-row serialization is skipped on updates ([#4](https://github.com/lukejudd-lux/peerdb/pull/4)).
 - **Leaner CDC pull path** — `_peerdb_data` is streamed as JSON instead of building an intermediate map ([#5](https://github.com/lukejudd-lux/peerdb/pull/5)); parsed SSH signers are cached and per-record debug logs no longer allocate when debug is off ([#6](https://github.com/lukejudd-lux/peerdb/pull/6)); and per-record allocations in the pull loop are trimmed ([upstream #4920](https://github.com/PeerDB-io/peerdb/pull/4920)). Together these cut flow-worker CPU ~13% in production at equal load.
 - **Per-replica metrics** — OTel `service.instance.id` is set per pod so multiple flow-worker replicas no longer collapse into a single metric series ([#2](https://github.com/lukejudd-lux/peerdb/pull/2)).
-- **SSH tunnel stability** — a tunnel is only torn down after consecutive keepalive misses, to ride out transient network blips ([#1](https://github.com/lukejudd-lux/peerdb/pull/1)).
+- **SSH tunnel stability** — the tunnel is only torn down after several consecutive keepalive misses (not a single delayed reply), and dialing honors context, enables TCP keepalives and bounds the handshake so a hung connection can't tie up a bastion slot ([#6](https://github.com/lukejudd-lux/peerdb/pull/6)).
 
 ## PeerDB
 
