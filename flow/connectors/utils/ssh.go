@@ -2,10 +2,12 @@ package utils
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +28,32 @@ type SSHTunnel struct {
 	badTunnel     atomic.Bool
 }
 
+// signerCache memoizes parsed SSH signers keyed by a hash of the private key.
+// ssh.ParsePrivateKey runs an RSA precompute (modular exponentiation) that showed
+// up as ~9% of flow-worker CPU because a new connector/tunnel is built for every
+// peer operation. The resulting signer is immutable and safe to reuse across
+// connections, so parse each distinct key once.
+var signerCache sync.Map // map[[32]byte]ssh.Signer
+
+func cachedSigner(privateKeyB64 string) (ssh.Signer, error) {
+	key := sha256.Sum256([]byte(privateKeyB64))
+	if v, ok := signerCache.Load(key); ok {
+		return v.(ssh.Signer), nil
+	}
+
+	pkey, err := base64.StdEncoding.DecodeString(privateKeyB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to base64 decode private key: %w", err)
+	}
+	signer, err := ssh.ParsePrivateKey(pkey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	actual, _ := signerCache.LoadOrStore(key, signer)
+	return actual.(ssh.Signer), nil
+}
+
 // GetSSHClientConfig returns an *ssh.ClientConfig based on provided credentials.
 func GetSSHClientConfig(config *protos.SSHConfig) (*ssh.ClientConfig, error) {
 	var authMethods []ssh.AuthMethod
@@ -37,14 +65,9 @@ func GetSSHClientConfig(config *protos.SSHConfig) (*ssh.ClientConfig, error) {
 
 	// Private key-based authentication
 	if config.PrivateKey != "" {
-		pkey, err := base64.StdEncoding.DecodeString(config.PrivateKey)
+		signer, err := cachedSigner(config.PrivateKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to base64 decode private key: %w", err)
-		}
-
-		signer, err := ssh.ParsePrivateKey(pkey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %w", err)
+			return nil, err
 		}
 
 		authMethods = append(authMethods, ssh.PublicKeys(signer))

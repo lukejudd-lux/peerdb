@@ -2,16 +2,39 @@ package utils
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/pem"
 	"testing"
 	"time"
 
 	toxiproxy "github.com/Shopify/toxiproxy/v2/client"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 )
 
 const toxiproxySSHLocalClosePort = 10001
+
+func TestCachedSigner_ParsesOnceAndReuses(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	block, err := ssh.MarshalPrivateKey(priv, "")
+	require.NoError(t, err)
+	b64 := base64.StdEncoding.EncodeToString(pem.EncodeToMemory(block))
+
+	s1, err := cachedSigner(b64)
+	require.NoError(t, err)
+	s2, err := cachedSigner(b64)
+	require.NoError(t, err)
+	require.Same(t, s1, s2, "the same private key must return the cached signer instance")
+
+	cfg, err := GetSSHClientConfig(&protos.SSHConfig{User: "testuser", PrivateKey: b64})
+	require.NoError(t, err)
+	require.Len(t, cfg.Auth, 1, "private key config should yield one auth method")
+}
 
 func TestSSHTunnel_GetKeepaliveChan_NilCases(t *testing.T) {
 	// Nil tunnel
