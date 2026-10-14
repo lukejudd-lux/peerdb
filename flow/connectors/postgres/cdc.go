@@ -70,6 +70,7 @@ type PostgresCDCSource struct {
 	flowJobName                              string
 	handleInheritanceForNonPartitionedTables bool
 	originMetadataAsDestinationColumn        bool
+	jsonPassthroughDefault                   bool
 	internalVersion                          uint32
 	warnedTypeChanges                        sync.Map
 }
@@ -87,6 +88,7 @@ type PostgresCDCConfig struct {
 	HandleInheritanceForNonPartitionedTables bool
 	SourceSchemaAsDestinationColumn          bool
 	OriginMetaAsDestinationColumn            bool
+	JSONPassthroughDefault                   bool
 	DestinationType                          protos.DBType
 	InternalVersion                          uint32
 }
@@ -193,6 +195,7 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		flowJobName:                              cdcConfig.FlowJobName,
 		handleInheritanceForNonPartitionedTables: cdcConfig.HandleInheritanceForNonPartitionedTables,
 		originMetadataAsDestinationColumn:        cdcConfig.OriginMetaAsDestinationColumn,
+		jsonPassthroughDefault:                   cdcConfig.JSONPassthroughDefault,
 		internalVersion:                          cdcConfig.InternalVersion,
 	}, nil
 }
@@ -403,28 +406,47 @@ func (p *PostgresCDCSource) shouldPassthroughJSONColumn(
 	nameAndExclude model.NameAndExclude,
 	col *pglogrepl.RelationMessageColumn,
 ) (bool, error) {
-	if _, ok := nameAndExclude.JSONPassthroughColumns[col.Name]; !ok {
+	_, explicit := nameAndExclude.JSONPassthroughColumns[col.Name]
+	// A column explicitly listed in json_passthrough_columns is validated strictly
+	// (misconfiguration is a hard error). Otherwise, when the default is enabled, we
+	// attempt passthrough for every eligible column and silently fall back to the
+	// normal decode/re-marshal path for anything ineligible, so enabling it globally
+	// can never break a mirror.
+	if !explicit && !p.jsonPassthroughDefault {
 		return false, nil
 	}
+
 	if p.destinationType != protos.DBType_BIGQUERY {
-		return false, fmt.Errorf("json passthrough column %s.%s configured for non-BigQuery destination %s",
-			nameAndExclude.Name, col.Name, p.destinationType)
+		if explicit {
+			return false, fmt.Errorf("json passthrough column %s.%s configured for non-BigQuery destination %s",
+				nameAndExclude.Name, col.Name, p.destinationType)
+		}
+		return false, nil
 	}
 
 	switch col.DataType {
 	case pgtype.JSONOID, pgtype.JSONBOID:
 	case pgtype.JSONArrayOID, pgtype.JSONBArrayOID:
-		return false, fmt.Errorf("json passthrough column %s.%s has unsupported Postgres JSON array type OID %d",
-			nameAndExclude.Name, col.Name, col.DataType)
+		if explicit {
+			return false, fmt.Errorf("json passthrough column %s.%s has unsupported Postgres JSON array type OID %d",
+				nameAndExclude.Name, col.Name, col.DataType)
+		}
+		return false, nil
 	default:
-		return false, fmt.Errorf("json passthrough column %s.%s has non-JSON Postgres type OID %d",
-			nameAndExclude.Name, col.Name, col.DataType)
+		if explicit {
+			return false, fmt.Errorf("json passthrough column %s.%s has non-JSON Postgres type OID %d",
+				nameAndExclude.Name, col.Name, col.DataType)
+		}
+		return false, nil
 	}
 
 	if err := validateJSONPassthroughTableSchema(
 		p.tableNameSchemaMapping[nameAndExclude.Name], nameAndExclude.Name, col.Name,
 	); err != nil {
-		return false, err
+		if explicit {
+			return false, err
+		}
+		return false, nil
 	}
 	return true, nil
 }

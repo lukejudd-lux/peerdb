@@ -592,6 +592,18 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
 		TargetForSetting: protos.DynconfTarget_BIGQUERY,
 	},
+	{
+		Name: "PEERDB_BIGQUERY_JSON_PASSTHROUGH",
+		Description: "BigQuery only: pass scalar json/jsonb columns through as raw text instead of " +
+			"decoding and re-marshaling them source-side (BigQuery still PARSE_JSONs them, so the result " +
+			"is identical). Enabled by default; ineligible columns fall back to the normal path. " +
+			"Columns listed explicitly in a mirror's json_passthrough_columns are always passed through " +
+			"regardless of this setting.",
+		DefaultValue:     "true",
+		ValueType:        protos.DynconfValueType_BOOL,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
+		TargetForSetting: protos.DynconfTarget_BIGQUERY,
+	},
 }
 
 var DynamicIndex = func() map[string]int {
@@ -767,6 +779,10 @@ func PeerDBQueryCDCNormalizeParallelism(ctx context.Context, env map[string]stri
 
 func PeerDBBigQueryGeoMakeValid(ctx context.Context, env map[string]string) (bool, error) {
 	return dynamicConfBool(ctx, env, "PEERDB_BIGQUERY_GEO_MAKE_VALID")
+}
+
+func PeerDBBigQueryJSONPassthrough(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_BIGQUERY_JSON_PASSTHROUGH")
 }
 
 func PeerDBCDCChannelBufferSize(ctx context.Context, env map[string]string) (int, error) {
