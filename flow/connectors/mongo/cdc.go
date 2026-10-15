@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/PeerDB-io/peerdb/flow/alerting"
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/internal"
 	"github.com/PeerDB-io/peerdb/flow/model"
@@ -34,6 +35,8 @@ const (
 	operationTypeUpdate  operationType = "update"
 	operationTypeReplace operationType = "replace"
 	operationTypeDelete  operationType = "delete"
+	operationTypeDrop    operationType = "drop"
+	operationTypeRename  operationType = "rename"
 )
 
 func parseOperationType(s string) (operationType, bool) {
@@ -235,6 +238,11 @@ func (c *MongoConnector) PullRecords(
 ) error {
 	defer req.RecordStream.Close()
 
+	var alerter *alerting.Alerter
+	if catalogPool.Pool != nil {
+		alerter = alerting.NewAlerter(ctx, catalogPool, otelManager)
+	}
+
 	fullDocumentColumnName := DefaultFullDocumentColumnName
 	if req.InternalVersion < shared.InternalVersion_MongoDBFullDocumentColumnToDoc {
 		fullDocumentColumnName = LegacyFullDocumentColumnName
@@ -297,8 +305,10 @@ func (c *MongoConnector) PullRecords(
 		// Wrapped in a closure so changeStream is evaluated at return time. A direct
 		// `defer changeStream.Close()` would bind the original stream created above
 		// and miss any replacement made by recreateChangeStream.
-		if err := changeStream.Close(); err != nil {
-			c.logger.Warn("failed to close change stream", slog.Any("error", err))
+		if changeStream != nil {
+			if err := changeStream.Close(); err != nil {
+				c.logger.Warn("failed to close change stream", slog.Any("error", err))
+			}
 		}
 	}()
 
@@ -314,12 +324,14 @@ func (c *MongoConnector) PullRecords(
 			attribute.Int64(otel_metrics.RowsInBatchKey, int64(recordCount)),
 			attribute.Int64(otel_metrics.BytesPulledKey, cumulativeBytesProcessed.Load()),
 		)
-		if rt := changeStream.ResumeToken(); rt != nil {
-			rtStr := base64.StdEncoding.EncodeToString(rt)
-			if len(rtStr) > 64 {
-				rtStr = rtStr[:64]
+		if changeStream != nil {
+			if rt := changeStream.ResumeToken(); rt != nil {
+				rtStr := base64.StdEncoding.EncodeToString(rt)
+				if len(rtStr) > 64 {
+					rtStr = rtStr[:64]
+				}
+				span.SetAttributes(attribute.String(otel_metrics.ResumeTokenKey, rtStr))
 			}
-			span.SetAttributes(attribute.String(otel_metrics.ResumeTokenKey, rtStr))
 		}
 		c.logger.Info("[mongo] PullRecords finished streaming",
 			slog.Uint64("records", uint64(recordCount)),
@@ -454,6 +466,7 @@ func (c *MongoConnector) PullRecords(
 		return nil
 	}
 
+	var lastEventGaugesRecordedAt time.Time
 	for recordCount < req.MaxBatchSize {
 		if ok := changeStream.Next(timeoutCtx); !ok {
 			err := changeStream.Err()
@@ -509,9 +522,14 @@ func (c *MongoConnector) PullRecords(
 			commitTime = changeEvent.WallTime.UTC()
 		}
 		commitTimeNanos := commitTime.UnixNano()
-		otelManager.Metrics.LatestConsumedLogEventGauge.Record(ctx, clusterTime.Unix())
-		otelManager.Metrics.SourceLagGauge.Record(ctx,
-			time.Now().UTC().Add(mongoClockOffset).Sub(commitTime).Milliseconds())
+
+		if time.Since(lastEventGaugesRecordedAt) >= time.Second {
+			// recording gauges per event is wasteful on CPU given this is on the hot path
+			otelManager.Metrics.LatestConsumedLogEventGauge.Record(ctx, clusterTime.Unix())
+			otelManager.Metrics.SourceLagGauge.Record(ctx,
+				time.Now().UTC().Add(mongoClockOffset).Sub(commitTime).Milliseconds())
+			lastEventGaugesRecordedAt = time.Now()
+		}
 
 		sourceTableName := fmt.Sprintf("%s.%s", changeEvent.Ns.Db, changeEvent.Ns.Coll)
 		destinationTableName := req.TableNameMapping[sourceTableName].Name
@@ -521,7 +539,7 @@ func (c *MongoConnector) PullRecords(
 			continue
 		}
 
-		items := model.NewMongoRecordItems(2)
+		items := model.NewRecordItems(2)
 		switch operationType(changeEvent.OperationType) {
 		case operationTypeInsert:
 			if err := addRecordItems(changeEvent.DocumentKey, changeEvent.FullDocument, &items, sourceTableName); err != nil {
@@ -565,8 +583,23 @@ func (c *MongoConnector) PullRecords(
 		default:
 			c.logger.Warn(fmt.Sprintf("skipping event with unsupported operation type '%s' (db=%s coll=%s)",
 				changeEvent.OperationType, changeEvent.Ns.Db, changeEvent.Ns.Coll))
+
+			// When the skipped event is a collection-level DDL (drop or rename), generate customer facing logs.
+			if alerter != nil {
+				switch operationType(changeEvent.OperationType) {
+				case operationTypeDrop, operationTypeRename:
+					ddlErr := fmt.Errorf(
+						"%s event on %s.%s: collection DDL is not replicated, the destination table is left unchanged",
+						changeEvent.OperationType, changeEvent.Ns.Db, changeEvent.Ns.Coll)
+					alerter.LogFlowWarning(ctx, req.FlowJobName, ddlErr)
+				}
+			} else {
+				c.logger.Error("Alerter not initialized")
+			}
+
 			continue
 		}
+		otelManager.Metrics.FetchedEventSizeHistogram.Record(ctx, changeEventSize)
 		checkpoint()
 	}
 
