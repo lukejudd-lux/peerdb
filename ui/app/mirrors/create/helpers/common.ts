@@ -51,6 +51,7 @@ export const blankCDCSetting: CDCConfig = {
   version: 0,
   flags: [],
   skipValidation: false,
+  queryCdcPullSyncParallelism: 0,
 };
 
 export const cdcSourceDefaults: { [index: string]: Partial<CDCConfig> } = {
@@ -88,6 +89,7 @@ export const blankQRepSetting: QRepConfig = {
   parentMirrorName: '',
   exclude: [],
   columns: [],
+  jsonPassthroughColumns: [],
   sourceType: DBType.DBTYPE_UNKNOWN,
   flags: [],
 };

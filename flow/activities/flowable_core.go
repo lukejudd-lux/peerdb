@@ -145,7 +145,13 @@ func pullAndSyncCore[TPull connectors.CDCPullConnectorCore, TSync connectors.CDC
 
 	tblNameMapping := make(map[string]model.NameAndExclude, len(options.TableMappings))
 	for _, v := range options.TableMappings {
-		tblNameMapping[v.SourceTableIdentifier] = model.NewNameAndExclude(v.DestinationTableIdentifier, v.Exclude)
+		tblNameMapping[v.SourceTableIdentifier] = model.NewNameAndExclude(
+			v.DestinationTableIdentifier, v.Exclude, v.JsonPassthroughColumns)
+	}
+
+	destinationType, err := connectors.LoadPeerType(ctx, a.CatalogPool, config.DestinationName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load destination peer type: %w", err)
 	}
 
 	if err := srcConn.ConnectionActive(ctx); err != nil {
@@ -242,6 +248,7 @@ func pullAndSyncCore[TPull connectors.CDCPullConnectorCore, TSync connectors.CDC
 			MaxBatchSize:                batchSize,
 			IdleTimeout:                 idleTimeout,
 			TableNameSchemaMapping:      tableNameSchemaMapping,
+			DestinationType:             destinationType,
 			OverridePublicationName:     config.PublicationName,
 			OverrideReplicationSlotName: config.ReplicationSlotName,
 			RecordStream:                recordBatchPull,
@@ -559,12 +566,9 @@ func replicateQRepPartition[TRead any, TWrite QRepStreamCloser, TSync connectors
 
 	if rowsSynced > 0 {
 		logger.Info(fmt.Sprintf("pushed %d records", rowsSynced))
-		if err := monitoring.UpdateRowsSyncedForPartition(ctx, a.CatalogPool, rowsSynced, runUUID, partition); err != nil {
-			return err
-		}
 	}
 
-	return monitoring.UpdateEndTimeForPartition(ctx, a.CatalogPool, runUUID, partition)
+	return monitoring.UpdateEndTimeAndRowsSyncedForPartition(ctx, a.CatalogPool, rowsSynced, runUUID, partition)
 }
 
 // replicateXminPartition replicates a XminPartition from the source to the destination.
@@ -675,15 +679,10 @@ func replicateXminPartition[TRead any, TWrite QRepStreamCloser, TSync connectors
 	}
 
 	if rowsSynced > 0 {
-		err := monitoring.UpdateRowsSyncedForPartition(ctx, a.CatalogPool, rowsSynced, runUUID, partition)
-		if err != nil {
-			return 0, err
-		}
-
 		logger.Info(fmt.Sprintf("pushed %d records", rowsSynced))
 	}
 
-	if err := monitoring.UpdateEndTimeForPartition(ctx, a.CatalogPool, runUUID, partition); err != nil {
+	if err := monitoring.UpdateEndTimeAndRowsSyncedForPartition(ctx, a.CatalogPool, rowsSynced, runUUID, partition); err != nil {
 		return 0, err
 	}
 
@@ -697,6 +696,12 @@ func (a *FlowableActivity) startNormalize(
 	normalizeResponses *concurrency.LastChan,
 ) error {
 	logger := internal.LoggerFromCtx(ctx)
+
+	// record gauge on error as well
+	defer func() {
+		a.OtelManager.Metrics.LastNormalizedBatchIdGauge.Record(ctx, normalizeResponses.Load(),
+			metric.WithAttributeSet(attribute.NewSet(attribute.String(otel_metrics.FlowNameKey, config.FlowJobName))))
+	}()
 
 	dstConn, dstClose, err := connectors.GetByNameAs[connectors.CDCNormalizeConnector](
 		ctx,
@@ -761,6 +766,8 @@ func (a *FlowableActivity) startNormalize(
 		logger.Info("normalized batches",
 			slog.Int64("startBatchID", res.StartBatchID), slog.Int64("endBatchID", res.EndBatchID), slog.Int64("syncBatchID", batchID))
 		normalizeResponses.Update(res.EndBatchID)
+		a.OtelManager.Metrics.LastNormalizedBatchIdGauge.Record(ctx, res.EndBatchID,
+			metric.WithAttributeSet(attribute.NewSet(attribute.String(otel_metrics.FlowNameKey, config.FlowJobName))))
 		if res.EndBatchID >= batchID {
 			return nil
 		}
@@ -833,31 +840,20 @@ func (a *FlowableActivity) normalizeLoop(
 			normalizingBatchID.Store(reqBatchID)
 			if err := a.startNormalize(ctx, config, reqBatchID, normalizeResponses); err != nil {
 				_ = a.Alerter.LogFlowError(ctx, config.FlowJobName, err)
-				for {
-					// update req to latest normalize request & retry
-					select {
-					case <-syncDone:
-						logger.Info("[normalize-loop] syncDone closed before retry")
-						return
-					case <-ctx.Done():
-						logger.Info("[normalize-loop] context closed before retry")
-						return
-					default:
-						time.Sleep(retryInterval)
-						retryInterval = min(retryInterval*2, 5*time.Minute)
-						// record the last normalized batch ID even if retry fails to populate metrics consistently
-						a.OtelManager.Metrics.LastNormalizedBatchIdGauge.Record(
-							ctx, lastNormalizedBatchID, metric.WithAttributeSet(attribute.NewSet(
-								attribute.String(otel_metrics.FlowNameKey, config.FlowJobName),
-							)))
-						reqBatchID = normalizeRequests.Load()
-						continue retryLoop
-					}
+				// update req to latest normalize request & retry
+				select {
+				case <-syncDone:
+					logger.Info("[normalize-loop] syncDone closed before retry")
+					return
+				case <-ctx.Done():
+					logger.Info("[normalize-loop] context closed before retry")
+					return
+				case <-time.After(retryInterval):
+					retryInterval = min(retryInterval*2, 5*time.Minute)
+					reqBatchID = normalizeRequests.Load()
+					continue retryLoop
 				}
 			}
-			a.OtelManager.Metrics.LastNormalizedBatchIdGauge.Record(ctx, reqBatchID, metric.WithAttributeSet(attribute.NewSet(
-				attribute.String(otel_metrics.FlowNameKey, config.FlowJobName),
-			)))
 			break
 		}
 	}

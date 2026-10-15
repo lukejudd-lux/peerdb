@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/storage"
@@ -293,31 +294,15 @@ func bigQuerySchemaToQRecordSchema(schema bigquery.Schema) (types.QRecordSchema,
 	fields := make([]types.QField, 0, len(schema))
 
 	for _, field := range schema {
-		qValueKind := BigQueryTypeToQValueKind(field)
-		if qValueKind == types.QValueKindInvalid {
+		qField := BigQueryFieldToQField(field)
+		if qField.Type == types.QValueKindInvalid {
 			return types.QRecordSchema{}, fmt.Errorf("unsupported BigQuery field type: %s for field %s", field.Type, field.Name)
-		}
-
-		qField := types.QField{
-			Name:         field.Name,
-			Type:         qValueKind,
-			OriginalType: string(field.Type),
-			Nullable:     !field.Required,
-			Precision:    int16(field.Precision),
-			Scale:        int16(field.Scale),
 		}
 
 		fields = append(fields, qField)
 	}
 
 	return types.NewQRecordSchema(fields), nil
-}
-
-func (c *BigQueryConnector) EnsurePullability(
-	ctx context.Context,
-	req *protos.EnsurePullabilityBatchInput,
-) (*protos.EnsurePullabilityBatchOutput, error) {
-	return nil, nil
 }
 
 func (c *BigQueryConnector) ExportTxSnapshot(
@@ -341,11 +326,43 @@ func (c *BigQueryConnector) ExportTxSnapshot(
 	runSnapshotStagingPath := basePath.JoinPath(activityInfo.WorkflowExecution.RunID).String()
 	c.logger.Info("Run snapshot staging path", slog.String("path", runSnapshotStagingPath))
 
-	jobs := make(map[string]*bigquery.Job)
-	for _, tm := range cfg.TableMappings {
-		exportSQL, err := c.bigQueryExportQueryStatement(ctx, tm.SourceTableIdentifier, runSnapshotStagingPath)
+	// snapshotTime (T) anchors every table's export below via FOR SYSTEM_TIME AS OF, so all
+	// tables are read as of the same consistent point in time.
+	snapshotTime, err := c.currentBigQueryTimestamp(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get current BigQuery timestamp for snapshot: %w", err)
+	}
+
+	if err := c.exportTablesAsOf(ctx, flowName, cfg.TableMappings, runSnapshotStagingPath, snapshotTime); err != nil {
+		return nil, nil, err
+	}
+
+	return &protos.ExportTxSnapshotOutput{SnapshotStagingPath: runSnapshotStagingPath}, runSnapshotStagingPath, nil
+}
+
+func (c *BigQueryConnector) exportTablesAsOf(
+	ctx context.Context,
+	flowName string,
+	tableMappings []*protos.TableMapping,
+	stagingPath string,
+	snapshotTime time.Time,
+) error {
+	return c.runTableExports(ctx, flowName, tableMappings, func(tm *protos.TableMapping) (string, error) {
+		return c.bigQueryExportQueryStatement(ctx, tm.SourceTableIdentifier, "", stagingPath, snapshotTime)
+	})
+}
+
+func (c *BigQueryConnector) runTableExports(
+	ctx context.Context,
+	flowName string,
+	tableMappings []*protos.TableMapping,
+	buildExportSQL func(tm *protos.TableMapping) (string, error),
+) error {
+	jobs := make(map[string]*bigquery.Job, len(tableMappings))
+	for _, tm := range tableMappings {
+		exportSQL, err := buildExportSQL(tm)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed to build export SQL for table %s: %w", tm.SourceTableIdentifier, err)
+			return fmt.Errorf("failed to build export SQL for table %s: %w", tm.SourceTableIdentifier, err)
 		}
 
 		q := c.client.Query(exportSQL)
@@ -361,21 +378,64 @@ func (c *BigQueryConnector) ExportTxSnapshot(
 				}
 			}
 
-			return nil, nil, fmt.Errorf("failed to start export job for table %s: %w", tm.SourceTableIdentifier, err)
+			return fmt.Errorf("failed to start export job for table %s: %w", tm.SourceTableIdentifier, err)
 		}
 		jobs[tm.SourceTableIdentifier] = job
 	}
 	for sourceTableIdentifier, job := range jobs {
 		if status, err := job.Wait(ctx); err != nil {
-			return nil, nil, fmt.Errorf("error waiting for export job to complete: %w", err)
+			return fmt.Errorf("error waiting for export job to complete: %w", err)
 		} else if err := status.Err(); err != nil {
-			return nil, nil, fmt.Errorf("export job completed with error: %w", err)
+			return fmt.Errorf("export job completed with error: %w", err)
 		}
 
 		_ = c.LogFlowInfo(ctx, flowName, "Exported snapshot data to GCS for table "+sourceTableIdentifier)
 	}
+	return nil
+}
 
-	return &protos.ExportTxSnapshotOutput{SnapshotStagingPath: runSnapshotStagingPath}, runSnapshotStagingPath, nil
+// maxWatermarkValue returns the current maximum value of watermarkColumn on
+// sourceTableIdentifier, or the current BigQuery-clock time if the table has no
+// rows -- there is nothing to snapshot, so CDC just starts capturing from now.
+func (c *BigQueryConnector) maxWatermarkValue(
+	ctx context.Context, sourceTableIdentifier, watermarkColumn string,
+) (time.Time, error) {
+	dsTable, err := c.convertToDatasetTable(sourceTableIdentifier)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse table identifier %s: %w", sourceTableIdentifier, err)
+	}
+
+	it, err := c.client.Query(fmt.Sprintf("SELECT MAX(TIMESTAMP(%s)) AS wm FROM %s",
+		quotedIdentifier(watermarkColumn), dsTable.stringQuoted())).Read(ctx)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to query max watermark for table %s: %w", sourceTableIdentifier, err)
+	}
+	var row struct {
+		Wm bigquery.NullTimestamp `bigquery:"wm"`
+	}
+	if err := it.Next(&row); err != nil {
+		return time.Time{}, fmt.Errorf("failed to read max watermark for table %s: %w", sourceTableIdentifier, err)
+	}
+	if !row.Wm.Valid {
+		return c.currentBigQueryTimestamp(ctx)
+	}
+	return row.Wm.Timestamp, nil
+}
+
+// currentBigQueryTimestamp queries BigQuery's own clock (rather than local wall-clock) so the
+// returned timestamp is consistent with BigQuery's FOR SYSTEM_TIME AS OF time-travel semantics.
+func (c *BigQueryConnector) currentBigQueryTimestamp(ctx context.Context) (time.Time, error) {
+	it, err := c.client.Query("SELECT CURRENT_TIMESTAMP() AS ts").Read(ctx)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to query current BigQuery timestamp: %w", err)
+	}
+	var row struct {
+		Ts time.Time `bigquery:"ts"`
+	}
+	if err := it.Next(&row); err != nil {
+		return time.Time{}, fmt.Errorf("failed to read current BigQuery timestamp: %w", err)
+	}
+	return row.Ts, nil
 }
 
 // bigQueryExportQueryStatement builds the EXPORT DATA SQL statement for exporting data from BigQuery to GCS in Parquet format.
@@ -385,7 +445,8 @@ func (c *BigQueryConnector) ExportTxSnapshot(
 // See: https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/export-statements#syntax
 func (c *BigQueryConnector) bigQueryExportQueryStatement(
 	ctx context.Context,
-	sourceTableIdentifier, snapshotStagingPath string,
+	sourceTableIdentifier, watermarkColumn, snapshotStagingPath string,
+	bound time.Time,
 ) (string, error) {
 	dsTable, err := c.convertToDatasetTable(sourceTableIdentifier)
 	if err != nil {
@@ -398,8 +459,23 @@ func (c *BigQueryConnector) bigQueryExportQueryStatement(
 		return "", fmt.Errorf("failed to get table metadata for %s: %w", sourceTableIdentifier, err)
 	}
 
-	columnSelects := make([]string, 0, len(metadata.Schema))
-	for _, field := range metadata.Schema {
+	return buildBigQueryExportSQL(dsTable, metadata.Schema, snapshotStagingPath, sourceTableIdentifier, bound, watermarkColumn), nil
+}
+
+// buildBigQueryExportSQL builds the EXPORT DATA SQL string. With watermarkColumn
+// empty, tables are read consistently as of bound via FOR SYSTEM_TIME AS OF
+// (EVENTS mode's shared BigQuery-clock snapshot). With watermarkColumn set
+// (BIGQUERY_REPLICATION_METHOD_QUERY), tables are instead filtered to
+// watermarkColumn <= bound, matching that table's own watermark progress.
+func buildBigQueryExportSQL(
+	dsTable datasetTable,
+	schema bigquery.Schema,
+	snapshotStagingPath, sourceTableIdentifier string,
+	bound time.Time,
+	watermarkColumn string,
+) string {
+	columnSelects := make([]string, 0, len(schema))
+	for _, field := range schema {
 		quotedName := quotedIdentifier(field.Name)
 		columnSelect := quotedName
 		switch field.Type {
@@ -419,20 +495,20 @@ func (c *BigQueryConnector) bigQueryExportQueryStatement(
 	}
 
 	uri := fmt.Sprintf("%s/%s/*.parquet", snapshotStagingPath, url.PathEscape(sourceTableIdentifier))
+	boundLiteral := bound.UTC().Format("2006-01-02 15:04:05.999999")
 
-	exportSQL := fmt.Sprintf(`EXPORT DATA OPTIONS(
-			uri='%s',
-			format='PARQUET',
-			compression='GZIP',
-			overwrite=true
-		) AS
-		SELECT %s FROM %s`,
+	from := fmt.Sprintf("%s FOR SYSTEM_TIME AS OF TIMESTAMP('%s UTC')", dsTable.stringQuoted(), boundLiteral)
+	if watermarkColumn != "" {
+		from = fmt.Sprintf("%s WHERE TIMESTAMP(%s) <= TIMESTAMP('%s UTC')",
+			dsTable.stringQuoted(), quotedIdentifier(watermarkColumn), boundLiteral)
+	}
+
+	return fmt.Sprintf(
+		"EXPORT DATA OPTIONS(uri='%s', format='PARQUET', compression='GZIP', overwrite=true) AS SELECT %s FROM %s",
 		uri,
 		strings.Join(columnSelects, ", "),
-		dsTable.stringQuoted(),
+		from,
 	)
-
-	return exportSQL, nil
 }
 
 func (c *BigQueryConnector) FinishExport(v any) error {
@@ -495,21 +571,109 @@ func (c *BigQueryConnector) FinishExport(v any) error {
 	return nil
 }
 
-func (c *BigQueryConnector) SetupReplConn(context.Context, map[string]string) error {
-	return nil
-}
-
-func (c *BigQueryConnector) UpdateReplStateLastOffset(context.Context, model.CdcCheckpoint) error {
-	return nil
-}
-
-func (c *BigQueryConnector) PullFlowCleanup(context.Context, string) error {
-	return nil
-}
-
+// SetupReplication is BigQuery's equivalent of capturing a starting replication position
+// (like MySQL's GTID/file-position capture): it has no replication slot to open, so it just
+// captures a BigQuery-clock timestamp T -- or, in QUERY replication mode, each table's own
+// max(watermark_column) -- and uses it as that table's initial CDC checkpoint. Unlike
+// MySQL/Postgres, BigQuery's initial load can't query the live table at pull time - QRep
+// pulls read pre-exported Parquet from GCS - so when the mirror wants an initial load
+// (req.DoInitialSnapshot), this also runs that export as of the same bound, the same way
+// ExportTxSnapshot does for pure snapshot-only flows.
 func (c *BigQueryConnector) SetupReplication(
-	context.Context, shared.CatalogPool,
-	*protos.SetupReplicationInput,
+	ctx context.Context,
+	catalogPool shared.CatalogPool,
+	req *protos.SetupReplicationInput,
 ) (model.SetupReplicationResult, error) {
+	cfg, err := internal.FetchConfigFromDB(ctx, catalogPool, req.FlowJobName)
+	if err != nil {
+		return model.SetupReplicationResult{}, fmt.Errorf("failed to fetch flow config from db: %w", err)
+	}
+
+	var checkpointByTable map[string]time.Time
+	if cfg.GetBigqueryCdcConfig().GetReplicationMethod() == protos.BigQueryReplicationMethod_BIGQUERY_REPLICATION_METHOD_QUERY {
+		checkpointByTable, err = c.setupQueryModeReplication(ctx, req, cfg)
+	} else {
+		checkpointByTable, err = c.setupEventsModeReplication(ctx, req, cfg)
+	}
+	if err != nil {
+		return model.SetupReplicationResult{}, err
+	}
+
+	if cfg.GetBigqueryCdcConfig() != nil {
+		for sourceTableIdentifier, checkpoint := range checkpointByTable {
+			if err := c.InitializeQueryCDCReplicationState(
+				ctx, req.FlowJobName, sourceTableIdentifier, EncodeBigQueryTableCursor(checkpoint),
+			); err != nil {
+				return model.SetupReplicationResult{}, fmt.Errorf(
+					"failed to initialize CDC checkpoint for table %s: %w", sourceTableIdentifier, err)
+			}
+		}
+	}
+
 	return model.SetupReplicationResult{}, nil
+}
+
+// setupEventsModeReplication captures a single BigQuery-clock timestamp T, exports the
+// initial snapshot as of T (EXPORT DATA ... FOR SYSTEM_TIME AS OF T), and returns T
+// (nudged past the snapshot, see below) as every table's initial CDC checkpoint.
+func (c *BigQueryConnector) setupEventsModeReplication(
+	ctx context.Context,
+	req *protos.SetupReplicationInput,
+	cfg *protos.FlowConnectionConfigsCore,
+) (map[string]time.Time, error) {
+	snapshotTime, err := c.currentBigQueryTimestamp(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get current BigQuery timestamp: %w", err)
+	}
+
+	if req.DoInitialSnapshot {
+		_ = c.LogFlowInfo(ctx, req.FlowJobName, "Starting initial-load BigQuery export to GCS staging bucket")
+		if err := c.exportTablesAsOf(ctx, req.FlowJobName, cfg.TableMappings, cfg.SnapshotStagingPath, snapshotTime); err != nil {
+			return nil, err
+		}
+	}
+
+	// APPENDS()/CHANGES()'s start_timestamp is inclusive (see cdc.go's pollWindow doc),
+	// but the snapshot export's FOR SYSTEM_TIME AS OF snapshotTime already includes rows
+	// committed exactly at snapshotTime. Nudging the first CDC checkpoint one microsecond
+	// past it -- BigQuery TIMESTAMP's finest granularity, so this can't skip a row --
+	// keeps CDC's first window from re-pulling what the snapshot already captured.
+	checkpointTime := snapshotTime.Add(time.Microsecond)
+	checkpointByTable := make(map[string]time.Time, len(cfg.TableMappings))
+	for _, tableMapping := range cfg.TableMappings {
+		checkpointByTable[tableMapping.SourceTableIdentifier] = checkpointTime
+	}
+	return checkpointByTable, nil
+}
+
+// setupQueryModeReplication fetches max(watermark_column) for each table and returns those
+// as each table's initial CDC checkpoint, exporting the initial snapshot filtered to
+// watermark_column <= that same bound so CDC's first poll (watermark_column > checkpoint)
+// picks up exactly where the snapshot left off.
+func (c *BigQueryConnector) setupQueryModeReplication(
+	ctx context.Context,
+	req *protos.SetupReplicationInput,
+	cfg *protos.FlowConnectionConfigsCore,
+) (map[string]time.Time, error) {
+	checkpointByTable := make(map[string]time.Time, len(cfg.TableMappings))
+	for _, tableMapping := range cfg.TableMappings {
+		watermark, err := c.maxWatermarkValue(ctx, tableMapping.SourceTableIdentifier, tableMapping.QueryCdcWatermarkColumn)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get max watermark for table %s: %w", tableMapping.SourceTableIdentifier, err)
+		}
+		checkpointByTable[tableMapping.SourceTableIdentifier] = watermark
+	}
+
+	if req.DoInitialSnapshot {
+		_ = c.LogFlowInfo(ctx, req.FlowJobName, "Starting initial-load BigQuery export to GCS staging bucket")
+		err := c.runTableExports(ctx, req.FlowJobName, cfg.TableMappings, func(tm *protos.TableMapping) (string, error) {
+			return c.bigQueryExportQueryStatement(
+				ctx, tm.SourceTableIdentifier, tm.QueryCdcWatermarkColumn, cfg.SnapshotStagingPath, checkpointByTable[tm.SourceTableIdentifier])
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return checkpointByTable, nil
 }

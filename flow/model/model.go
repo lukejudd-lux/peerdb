@@ -14,19 +14,32 @@ import (
 )
 
 type NameAndExclude struct {
-	Exclude map[string]struct{}
-	Name    string
+	Exclude                map[string]struct{}
+	JSONPassthroughColumns map[string]struct{}
+	Name                   string
 }
 
-func NewNameAndExclude(name string, exclude []string) NameAndExclude {
-	var exset map[string]struct{}
-	if len(exclude) != 0 {
-		exset = make(map[string]struct{}, len(exclude))
-		for _, col := range exclude {
-			exset[col] = struct{}{}
-		}
+func newStringSet(values []string) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
 	}
-	return NameAndExclude{Name: name, Exclude: exset}
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func NewNameAndExclude(name string, exclude []string, jsonPassthroughColumns ...[]string) NameAndExclude {
+	var passthroughColumns []string
+	if len(jsonPassthroughColumns) != 0 {
+		passthroughColumns = jsonPassthroughColumns[0]
+	}
+	return NameAndExclude{
+		Exclude:                newStringSet(exclude),
+		JSONPassthroughColumns: newStringSet(passthroughColumns),
+		Name:                   name,
+	}
 }
 
 type RecordTypeCounts struct {
@@ -76,6 +89,8 @@ type PullRecordsRequest[T Items] struct {
 	TableNameMapping map[string]NameAndExclude
 	// tablename to schema mapping
 	TableNameSchemaMapping map[string]*protos.TableSchema
+	// DestinationType is the destination peer type for destination-specific source decoding.
+	DestinationType protos.DBType
 	// overrides dynamic configuration
 	Env map[string]string
 	// override publication name
@@ -92,9 +107,81 @@ type PullRecordsRequest[T Items] struct {
 	IdleTimeout time.Duration
 }
 
+// PullTableRecordsRequest is one table's pull request in the query-based CDC
+// path (see QueryCDCPullConnector). Unlike PullRecordsRequest, there is one of
+// these per source table per poll, each with its own stream.
+//
+//nolint:govet // keeping field comments over alignment
+type PullTableRecordsRequest struct {
+	// overrides dynamic configuration
+	Env map[string]string
+	// FlowJobName is the name of the flow job.
+	FlowJobName string
+	// SourceTableIdentifier is the source table this request pulls.
+	SourceTableIdentifier string
+	// NameAndExclude carries the destination table name and excluded columns.
+	NameAndExclude NameAndExclude
+	// Cursor is the opaque value previously returned for this table by
+	// PullTableRecordsResult.NextCursor, empty for a table pulled for the first time.
+	Cursor string
+	// Stream is where pulled records are pushed.
+	Stream *CDCStream[RecordItems]
+}
+
+// PullTableRecordsResult is returned by QueryCDCPullConnector.PullTableRecords.
+type PullTableRecordsResult struct {
+	// NextCursor is persisted and passed back as PullTableRecordsRequest.Cursor
+	// on this table's next poll.
+	NextCursor string
+	// BytesProcessed is the number of bytes fetched from the source for this poll.
+	BytesProcessed int64
+}
+
+// SyncQueryCDCRequest carries one table's CDC records to
+// QueryCDCSyncConnector.SyncQueryCDC, which stages them (e.g. as Avro on
+// S3/GCS) under BatchID, this table's own batch sequence, independent of
+// every other table's, without touching the final destination table.
+//
+//nolint:govet // logically grouped, fieldalignment confuses things
+type SyncQueryCDCRequest struct {
+	Env          map[string]string
+	FlowJobName  string
+	TableMapping *protos.TableMapping
+	TableSchema  *protos.TableSchema
+	Records      <-chan Record[RecordItems]
+	Version      uint32
+	Flags        []string
+	SchemaDeltas []*protos.TableSchemaDelta
+	// BatchID is this table's own batch sequence number for the records being
+	// staged, persisted as its new synced_batch_id on success.
+	BatchID           int64
+	SoftDeleteColName string
+}
+
+// NormalizeQueryCDCRequest asks QueryCDCSyncConnector.NormalizeQueryCDC to
+// insert batches [StartBatchID, EndBatchID], previously staged by
+// SyncQueryCDC, straight into the final destination table, bypassing any
+// raw-table hop.
+//
+//nolint:govet // logically grouped, fieldalignment confuses things
+type NormalizeQueryCDCRequest struct {
+	Env          map[string]string
+	FlowJobName  string
+	TableMapping *protos.TableMapping
+	TableSchema  *protos.TableSchema
+	Version      uint32
+	Flags        []string
+	// StartBatchID is the table's last normalized batch plus one, and EndBatchID
+	// is the table's last synced batch. Both bounds are inclusive.
+	StartBatchID      int64
+	EndBatchID        int64
+	SoftDeleteColName string
+}
+
 type ToJSONOptions struct {
-	UnnestColumns map[string]struct{}
-	HStoreAsJSON  bool
+	UnnestColumns        map[string]struct{}
+	HStoreAsJSON         bool
+	ClearValuesOverBytes int // 0 means preserve values
 }
 
 func NewToJSONOptions(unnestCols []string, hstoreAsJSON bool) ToJSONOptions {

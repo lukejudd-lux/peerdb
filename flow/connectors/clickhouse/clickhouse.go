@@ -77,9 +77,16 @@ func NewClickHouseConnector(
 func (c *ClickHouseConnector) ValidateCheck(ctx context.Context) error {
 	allowedDomains := internal.PeerDBClickHouseAllowedDomains()
 
-	return peerdb_clickhouse.ValidateClickHousePeer(
-		ctx, c.logger, allowedDomains, c.Config.Host, c.database, c.staging.Validate,
-	)
+	if err := peerdb_clickhouse.ValidateClickHousePeer(
+		ctx, c.logger, allowedDomains, c.Config.Host, c.database, c.staging.ClickHouseAccessMethod(),
+	); err != nil {
+		return err
+	}
+
+	if err := c.staging.Validate(ctx); err != nil {
+		return fmt.Errorf("failed to validate staging bucket: %w", err)
+	}
+	return nil
 }
 
 // configureDirectoryTLS configures the tls.Config by loading certificate files
@@ -210,8 +217,32 @@ func Connect(ctx context.Context, env map[string]string, config *protos.Clickhou
 	} else if maxInsertThreads != 0 {
 		settings["max_insert_threads"] = maxInsertThreads
 	}
+	if parallelViewProcessing, err := internal.PeerDBClickHouseParallelViewProcessing(ctx, env); err != nil {
+		return nil, fmt.Errorf("failed to load parallel_view_processing config: %w", err)
+	} else if parallelViewProcessing {
+		settings["parallel_view_processing"] = uint64(1)
+	}
 	if config.Cluster != "" {
 		settings["insert_distributed_sync"] = uint64(1)
+	}
+	if config.Replicated {
+		// On a multi-replica ReplicatedMergeTree cluster, normalize populates the raw table and then
+		// immediately reads it back via INSERT ... SELECT. Those two statements may run on different
+		// connections/replicas (e.g. behind a load-balanced host), so the read can hit a replica that
+		// has not yet replicated the just-written parts. select_sequential_consistency (set above) only
+		// guarantees visibility of quorum-inserted blocks, so without quorum writes it enforces nothing
+		// and normalize silently drops rows it marks as processed. Writing with quorum closes the race:
+		// insert_quorum_parallel=0 is required for sequential-consistency reads to be honored.
+		if quorum, err := internal.PeerDBClickHouseEnableReplicatedQuorum(ctx, env); err != nil {
+			return nil, fmt.Errorf("failed to load replicated quorum config: %w", err)
+		} else if quorum {
+			// Supported by ClickHouse 22.9+
+			settings["insert_quorum"] = "auto"
+			settings["insert_quorum_parallel"] = uint64(0)
+			// Explicitly pin the read side of the read-your-writes contract alongside the quorum
+			// writes so it stays paired with them regardless of the global default.
+			settings["select_sequential_consistency"] = uint64(1)
+		}
 	}
 	clientName, err := internal.PeerDBClickHouseClientName(ctx, env)
 	if err != nil {

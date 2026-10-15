@@ -282,6 +282,42 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		TargetForSetting: protos.DynconfTarget_BIGQUERY,
 	},
 	{
+		Name: "PEERDB_BIGQUERY_CDC_SAFETY_LAG_SECONDS",
+		Description: "BigQuery CDC only: keeps a poll window's upper bound this many seconds behind BigQuery's " +
+			"clock, since APPENDS()/CHANGES() consistency for very recent writes is undocumented",
+		DefaultValue:     "60",
+		ValueType:        protos.DynconfValueType_INT,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
+	},
+	{
+		Name: "PEERDB_BIGQUERY_CDC_MAX_QUERY_WINDOW_SECONDS",
+		Description: "BigQuery CDC only: caps how much time a single APPENDS()/CHANGES() poll can cover, " +
+			"bounding one BigQuery job's row-scan cost even if a mirror falls far behind",
+		DefaultValue:     "86400",
+		ValueType:        protos.DynconfValueType_INT,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
+	},
+	{
+		Name: "PEERDB_QUERY_CDC_PULL_SYNC_PARALLELISM",
+		Description: "Query-based CDC only: default for how many source tables are queried and staged concurrently, " +
+			"used when a mirror does not set query_cdc_pull_sync_parallelism; 0 or less removes the limit",
+		DefaultValue:     "10",
+		ValueType:        protos.DynconfValueType_INT,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
+	},
+	{
+		Name: "PEERDB_QUERY_CDC_NORMALIZE_PARALLELISM",
+		Description: "Query-based CDC only: how many tables are normalized into the destination concurrently, " +
+			"bounding destination load when many tables catch up at once; 0 or less removes the limit",
+		DefaultValue:     "4",
+		ValueType:        protos.DynconfValueType_INT,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
+	},
+	{
 		Name:             "PEERDB_CLICKHOUSE_ENABLE_PRIMARY_UPDATE",
 		Description:      "Enable generating deletion records for updates in ClickHouse, avoids stale records when primary key updated",
 		DefaultValue:     "false",
@@ -298,10 +334,30 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
 	},
 	{
+		Name: "PEERDB_CLICKHOUSE_PARALLEL_VIEW_PROCESSING",
+		Description: "Enables parallel_view_processing setting on clickhouse, pushing to attached materialized views " +
+			"concurrently during inserts",
+		DefaultValue:     "false",
+		ValueType:        protos.DynconfValueType_BOOL,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
+	},
+	{
 		Name:             "PEERDB_CLICKHOUSE_PARALLEL_NORMALIZE",
 		Description:      "Divide tables in batch into N insert selects. Helps distribute load to multiple nodes",
 		DefaultValue:     "0",
 		ValueType:        protos.DynconfValueType_INT,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
+	},
+	{
+		Name: "PEERDB_CLICKHOUSE_ENABLE_REPLICATED_QUORUM",
+		Description: "On Replicated ClickHouse clusters, write raw/normalize inserts with quorum " +
+			"(insert_quorum=auto, insert_quorum_parallel=0) so that select_sequential_consistency reads " +
+			"see them regardless of which replica serves the read. Prevents normalize silently dropping " +
+			"rows when the read hits a replica that has not yet replicated the just-written raw parts.",
+		DefaultValue:     "false",
+		ValueType:        protos.DynconfValueType_BOOL,
 		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
 		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
 	},
@@ -469,14 +525,6 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		TargetForSetting: protos.DynconfTarget_ALL,
 	},
 	{
-		Name:             "PEERDB_MYSQL_DEFAULT_PARTITION_KEY_ENABLED",
-		Description:      "Enables automatic detection of a default partition key from primary key for MySQL initial load",
-		DefaultValue:     "true",
-		ValueType:        protos.DynconfValueType_BOOL,
-		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_NEW_MIRROR,
-		TargetForSetting: protos.DynconfTarget_ALL,
-	},
-	{
 		Name:             "PEERDB_OFFLOAD_PARTITION_RANGES",
 		Description:      "Encrypt QRep partition ranges and offload them to the catalog instead of passing them through Temporal",
 		DefaultValue:     "true",
@@ -510,6 +558,15 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		TargetForSetting: protos.DynconfTarget_ALL,
 	},
 	{
+		Name: "PEERDB_MYSQL_SKIP_GTID_SET",
+		Description: "GTID set merged into MySQL CDC checkpoint at stream start, skipping those transactions, " +
+			"which can cause data loss. Set per mirror to recover from purged binlogs, using missing set reported by error 1236",
+		DefaultValue:     "",
+		ValueType:        protos.DynconfValueType_STRING,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
+		TargetForSetting: protos.DynconfTarget_ALL,
+	},
+	{
 		Name: "PEERDB_MONGODB_EXCLUDED_OPERATION_TYPES",
 		Description: "Comma-separated list of MongoDB change stream operation types to exclude from CDC " +
 			"(allowed values: insert, update, replace, delete)",
@@ -517,6 +574,35 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		ValueType:        protos.DynconfValueType_STRING,
 		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
 		TargetForSetting: protos.DynconfTarget_ALL,
+	},
+	{
+		Name: "PEERDB_POSTGRES_RAW_BATCH_CLEANUP_THRESHOLD",
+		Description: "Number of normalized batches to retain in raw table. After normalize, batches older " +
+			"than normalize_batch_id minus this value are deleted. 0 disables cleanup",
+		DefaultValue:     "0",
+		ValueType:        protos.DynconfValueType_INT,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_POSTGRES,
+	},
+	{
+		Name:             "PEERDB_BIGQUERY_GEO_MAKE_VALID",
+		Description:      "BigQuery only: use make_valid parameter in ST_GEOGFROMTEXT to repair geometries that are invalid under S2 during merge and initial load",
+		DefaultValue:     "false",
+		ValueType:        protos.DynconfValueType_BOOL,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
+		TargetForSetting: protos.DynconfTarget_BIGQUERY,
+	},
+	{
+		Name: "PEERDB_BIGQUERY_JSON_PASSTHROUGH",
+		Description: "BigQuery only: pass scalar json/jsonb columns through as raw text instead of " +
+			"decoding and re-marshaling them source-side (BigQuery still PARSE_JSONs them, so the result " +
+			"is identical). Enabled by default; ineligible columns fall back to the normal path. " +
+			"Columns listed explicitly in a mirror's json_passthrough_columns are always passed through " +
+			"regardless of this setting.",
+		DefaultValue:     "true",
+		ValueType:        protos.DynconfValueType_BOOL,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
+		TargetForSetting: protos.DynconfTarget_BIGQUERY,
 	},
 }
 
@@ -667,6 +753,38 @@ func PeerDBBigQueryToastMergeChunking(ctx context.Context, env map[string]string
 	return dynamicConfUnsigned[uint32](ctx, env, "PEERDB_BIGQUERY_TOAST_MERGE_CHUNKING")
 }
 
+func PeerDBBigQueryCDCSafetyLag(ctx context.Context, env map[string]string) (time.Duration, error) {
+	x, err := dynamicConfSigned[int64](ctx, env, "PEERDB_BIGQUERY_CDC_SAFETY_LAG_SECONDS")
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(x) * time.Second, nil
+}
+
+func PeerDBBigQueryCDCMaxQueryWindow(ctx context.Context, env map[string]string) (time.Duration, error) {
+	x, err := dynamicConfSigned[int64](ctx, env, "PEERDB_BIGQUERY_CDC_MAX_QUERY_WINDOW_SECONDS")
+	if err != nil {
+		return 0, err
+	}
+	return time.Duration(x) * time.Second, nil
+}
+
+func PeerDBQueryCDCPullSyncParallelism(ctx context.Context, env map[string]string) (int, error) {
+	return dynamicConfSigned[int](ctx, env, "PEERDB_QUERY_CDC_PULL_SYNC_PARALLELISM")
+}
+
+func PeerDBQueryCDCNormalizeParallelism(ctx context.Context, env map[string]string) (int, error) {
+	return dynamicConfSigned[int](ctx, env, "PEERDB_QUERY_CDC_NORMALIZE_PARALLELISM")
+}
+
+func PeerDBBigQueryGeoMakeValid(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_BIGQUERY_GEO_MAKE_VALID")
+}
+
+func PeerDBBigQueryJSONPassthrough(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_BIGQUERY_JSON_PASSTHROUGH")
+}
+
 func PeerDBCDCChannelBufferSize(ctx context.Context, env map[string]string) (int, error) {
 	return dynamicConfSigned[int](ctx, env, "PEERDB_CDC_CHANNEL_BUFFER_SIZE")
 }
@@ -681,6 +799,10 @@ func PeerDBMySQLBinlogStalenessSeconds(ctx context.Context, env map[string]strin
 		return 0, err
 	}
 	return time.Duration(x) * time.Second, nil
+}
+
+func PeerDBMySQLSkipGTIDSet(ctx context.Context, env map[string]string) (string, error) {
+	return dynLookup(ctx, env, "PEERDB_MYSQL_SKIP_GTID_SET")
 }
 
 func PeerDBNormalizeBufferHours(ctx context.Context, env map[string]string) (int64, error) {
@@ -768,8 +890,16 @@ func PeerDBClickHouseMaxInsertThreads(ctx context.Context, env map[string]string
 	return dynamicConfSigned[int64](ctx, env, "PEERDB_CLICKHOUSE_MAX_INSERT_THREADS")
 }
 
+func PeerDBClickHouseParallelViewProcessing(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_CLICKHOUSE_PARALLEL_VIEW_PROCESSING")
+}
+
 func PeerDBClickHouseParallelNormalize(ctx context.Context, env map[string]string) (int, error) {
 	return dynamicConfSigned[int](ctx, env, "PEERDB_CLICKHOUSE_PARALLEL_NORMALIZE")
+}
+
+func PeerDBClickHouseEnableReplicatedQuorum(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_CLICKHOUSE_ENABLE_REPLICATED_QUORUM")
 }
 
 func PeerDBEnableClickHouseNumericAsString(ctx context.Context, env map[string]string) (bool, error) {
@@ -820,12 +950,18 @@ func PeerDBS3UuidPrefix(ctx context.Context, env map[string]string) (bool, error
 	return dynamicConfBool(ctx, env, "PEERDB_S3_UUID_PREFIX")
 }
 
+var peerDBS3PartSizeCache CachedDynconfSetting[int64]
+
 func PeerDBS3PartSize(ctx context.Context, env map[string]string) (int64, error) {
-	return dynamicConfSigned[int64](ctx, env, "PEERDB_S3_PART_SIZE")
+	peerDBS3PartSizeCache.InitOnce("PEERDB_S3_PART_SIZE", 30*time.Second, dynamicConfSigned[int64])
+	return peerDBS3PartSizeCache.Get(ctx, env)
 }
 
+var peerDBS3BytesPerAvroFileCache CachedDynconfSetting[int64]
+
 func PeerDBS3BytesPerAvroFile(ctx context.Context, env map[string]string) (int64, error) {
-	return dynamicConfSigned[int64](ctx, env, "PEERDB_S3_BYTES_PER_AVRO_FILE")
+	peerDBS3BytesPerAvroFileCache.InitOnce("PEERDB_S3_BYTES_PER_AVRO_FILE", 30*time.Second, dynamicConfSigned[int64])
+	return peerDBS3BytesPerAvroFileCache.Get(ctx, env)
 }
 
 // Kafka has topic auto create as an option, auto.create.topics.enable
@@ -899,10 +1035,6 @@ func PeerDBPostgresApplyCtidBlockPartitioning(ctx context.Context, env map[strin
 	return dynamicConfBool(ctx, env, "PEERDB_POSTGRES_APPLY_CTID_BLOCK_PARTITIONING_OVERRIDE")
 }
 
-func PeerDBMySQLDefaultPartitionKeyEnabled(ctx context.Context, env map[string]string) (bool, error) {
-	return dynamicConfBool(ctx, env, "PEERDB_MYSQL_DEFAULT_PARTITION_KEY_ENABLED")
-}
-
 func PeerDBOffloadPartitionRanges(ctx context.Context, env map[string]string) (bool, error) {
 	return dynamicConfBool(ctx, env, "PEERDB_OFFLOAD_PARTITION_RANGES")
 }
@@ -923,4 +1055,8 @@ func PeerDBMongoDBExcludedOperationTypes(ctx context.Context, env map[string]str
 		}
 	}
 	return ops, nil
+}
+
+func PeerDBPostgresRawBatchCleanupThreshold(ctx context.Context, env map[string]string) (int64, error) {
+	return dynamicConfSigned[int64](ctx, env, "PEERDB_POSTGRES_RAW_BATCH_CLEANUP_THRESHOLD")
 }

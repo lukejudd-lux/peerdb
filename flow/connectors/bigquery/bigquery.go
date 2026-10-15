@@ -2,13 +2,13 @@ package connbigquery
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"cloud.google.com/go/auth"
@@ -26,10 +26,17 @@ import (
 	"github.com/PeerDB-io/peerdb/flow/model"
 	"github.com/PeerDB-io/peerdb/flow/pkg/common"
 	"github.com/PeerDB-io/peerdb/flow/shared"
+	"github.com/PeerDB-io/peerdb/flow/shared/types"
 )
 
 const (
 	SyncRecordsBatchSize = 1024
+
+	// schemaDeltaDDLTimeout bounds each ALTER TABLE issued during schema delta
+	// replay so that a persistently retrying BigQuery job (e.g. hitting the
+	// table metadata update rate limit) fails fast instead of blocking the
+	// sync activity indefinitely.
+	schemaDeltaDDLTimeout = 2 * time.Minute
 )
 
 func NewBigQueryServiceAccount(bqConfig *protos.BigqueryConfig) (*utils.GcpServiceAccount, error) {
@@ -52,9 +59,16 @@ func NewBigQueryServiceAccount(bqConfig *protos.BigqueryConfig) (*utils.GcpServi
 	return &serviceAccount, nil
 }
 
+//nolint:govet // logically grouped, fieldalignment confuses things
 type BigQueryConnector struct {
+	// droppedExcludeColumns remembers, per source table, excluded columns that
+	// BigQuery has reported as no longer existing, so later polls stop asking BigQuery
+	// to EXCEPT them. Guarded by droppedExcludeColumnsMu since concurrent per-table
+	// pull loops share this connector.
+	droppedExcludeColumnsMu sync.Mutex
+	droppedExcludeColumns   map[string]map[string]struct{}
+	logger                  log.Logger
 	*metadataStore.PostgresMetadata
-	logger        log.Logger
 	bqConfig      *protos.BigqueryConfig
 	credentials   *auth.Credentials
 	client        *bigquery.Client
@@ -67,51 +81,55 @@ type BigQueryConnector struct {
 func NewBigQueryConnector(ctx context.Context, config *protos.BigqueryConfig) (*BigQueryConnector, error) {
 	logger := internal.LoggerFromCtx(ctx)
 
-	datasetID := config.GetDatasetId()
-	projectID := config.GetProjectId()
-	projectPart, datasetPart, found := strings.Cut(datasetID, ".")
-	if found && strings.Contains(datasetPart, ".") {
-		return nil,
-			fmt.Errorf("invalid dataset ID: %s. Ensure that it is just a single string or string1.string2", datasetID)
-	}
-	if projectPart != "" && datasetPart != "" {
-		datasetID = datasetPart
-		projectID = projectPart
-	}
-
-	serviceAccount, err := NewBigQueryServiceAccount(config)
+	projectID, datasetID, err := resolveBigQueryResource(config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create BigQueryServiceAccount: %w", err)
+		return nil, err
 	}
 
-	saJSON, err := json.Marshal(serviceAccount) //nolint:gosec // G117: credential struct marshaled for inline use
+	credentialConfig, err := newBigQueryCredentialConfig(ctx, config, projectID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal service account: %v", err)
+		return nil, err
 	}
 
-	creds, err := credentials.DetectDefault(&credentials.DetectOptions{
-		CredentialsJSON: saJSON,
+	detectOptions := &credentials.DetectOptions{
 		Scopes: []string{
 			bigquery.Scope,
 			storage.ScopeFullControl, // we should split it into two clients later
 		},
-	})
+	}
+	var creds *auth.Credentials
+	if credentialConfig.credentialType == credentials.ExternalAccount {
+		creds, err = credentials.NewCredentialsFromJSON(
+			credentials.ExternalAccount,
+			credentialConfig.credentialsJSON,
+			detectOptions,
+		)
+	} else {
+		// Keep the legacy service-account-key path unchanged.
+		detectOptions.CredentialsJSON = credentialConfig.credentialsJSON //nolint:staticcheck // Preserve legacy service-account-key behavior.
+		creds, err = credentials.DetectDefault(detectOptions)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to create credentials: %v", err)
 	}
 
+	meteredHTTPClient, err := newMeteredClient(ctx, creds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create metered BigQuery HTTP client: %v", err)
+	}
 	client, err := bigquery.NewClient(
 		ctx,
-		bigquery.DetectProjectID,
+		credentialConfig.clientProjectID,
 		option.WithAuthCredentials(creds),
+		option.WithHTTPClient(meteredHTTPClient),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create BigQuery client: %v", err)
 	}
 
-	if _, err := client.DatasetInProject(projectID, datasetID).Metadata(ctx); err != nil {
-		logger.Error("failed to get dataset metadata", slog.Any("error", err))
-		return nil, fmt.Errorf("failed to get dataset metadata: %v", err)
+	if err := validateBigQueryConnection(ctx, client, projectID, datasetID); err != nil {
+		logger.Error("failed to validate BigQuery connection", slog.Any("error", err))
+		return nil, err
 	}
 
 	storageClient, err := storage.NewClient(ctx, option.WithAuthCredentials(creds))
@@ -125,24 +143,21 @@ func NewBigQueryConnector(ctx context.Context, config *protos.BigqueryConfig) (*
 	}
 
 	return &BigQueryConnector{
-		credentials:      creds,
-		bqConfig:         config,
-		client:           client,
-		datasetID:        datasetID,
-		projectID:        projectID,
-		PostgresMetadata: metadataStore.NewPostgresMetadataFromCatalog(logger, catalogPool),
-		storageClient:    storageClient,
-		catalogPool:      catalogPool,
-		logger:           logger,
+		credentials:           creds,
+		bqConfig:              config,
+		client:                client,
+		datasetID:             datasetID,
+		projectID:             projectID,
+		PostgresMetadata:      metadataStore.NewPostgresMetadataFromCatalog(logger, catalogPool),
+		storageClient:         storageClient,
+		catalogPool:           catalogPool,
+		logger:                logger,
+		droppedExcludeColumns: make(map[string]map[string]struct{}),
 	}, nil
 }
 
 func (c *BigQueryConnector) ValidateCheck(ctx context.Context) error {
-	if _, err := c.client.DatasetInProject(c.projectID, c.datasetID).Metadata(ctx); err != nil {
-		return fmt.Errorf("failed to get dataset metadata: %v", err)
-	}
-
-	return nil
+	return validateBigQueryConnection(ctx, c.client, c.projectID, c.datasetID)
 }
 
 func (c *BigQueryConnector) ValidateMirrorDestination(
@@ -200,10 +215,25 @@ func (c *BigQueryConnector) Close() error {
 
 // ConnectionActive returns nil if the connection is active.
 func (c *BigQueryConnector) ConnectionActive(ctx context.Context) error {
-	if _, err := c.client.DatasetInProject(c.projectID, c.datasetID).Metadata(ctx); err != nil {
-		return fmt.Errorf("failed to get dataset metadata: %v", err)
-	}
+	return validateBigQueryConnection(ctx, c.client, c.projectID, c.datasetID)
+}
 
+func validateBigQueryConnection(
+	ctx context.Context,
+	client *bigquery.Client,
+	projectID, datasetID string,
+) error {
+	if datasetID == "" {
+		datasets := client.Datasets(ctx)
+		datasets.ProjectID = projectID
+		if _, err := datasets.Next(); err != nil && !errors.Is(err, iterator.Done) {
+			return fmt.Errorf("failed to list BigQuery datasets: %w", err)
+		}
+		return nil
+	}
+	if _, err := client.DatasetInProject(projectID, datasetID).Metadata(ctx); err != nil {
+		return fmt.Errorf("failed to get dataset metadata: %w", err)
+	}
 	return nil
 }
 
@@ -247,41 +277,58 @@ func (c *BigQueryConnector) ReplayTableSchemaDeltas(
 			continue
 		}
 
-	AddedColumnsLoop:
+		dstDatasetTable, err := c.convertToDatasetTable(schemaDelta.DstTableName)
+		if err != nil {
+			return err
+		}
+
+		table := c.client.DatasetInProject(c.projectID, dstDatasetTable.dataset).Table(dstDatasetTable.table)
+		dstMetadata, metadataErr := table.Metadata(ctx)
+		if metadataErr != nil {
+			return fmt.Errorf("failed to get metadata for table %s: %w", schemaDelta.DstTableName, metadataErr)
+		}
+		existingColumns := make(map[string]struct{}, len(dstMetadata.Schema))
+		for _, field := range dstMetadata.Schema {
+			existingColumns[field.Name] = struct{}{}
+		}
+
+		addColumnClauses := make([]string, 0, len(schemaDelta.AddedColumns))
+		addedColumnNames := make([]string, 0, len(schemaDelta.AddedColumns))
 		for _, addedColumn := range schemaDelta.AddedColumns {
-			dstDatasetTable, err := c.convertToDatasetTable(schemaDelta.DstTableName)
-			if err != nil {
-				return err
-			}
-
-			table := c.client.DatasetInProject(c.projectID, dstDatasetTable.dataset).Table(dstDatasetTable.table)
-			dstMetadata, metadataErr := table.Metadata(ctx)
-			if metadataErr != nil {
-				return fmt.Errorf("failed to get metadata for table %s: %w", schemaDelta.DstTableName, metadataErr)
-			}
-
-			// check if the column already exists
-			for _, field := range dstMetadata.Schema {
-				if field.Name == addedColumn.Name {
-					c.logger.Info(fmt.Sprintf("[schema delta replay] column %s already exists in table %s",
-						addedColumn.Name, schemaDelta.DstTableName))
-					continue AddedColumnsLoop
-				}
+			if _, exists := existingColumns[addedColumn.Name]; exists {
+				c.logger.Info(fmt.Sprintf("[schema delta replay] column %s already exists in table %s",
+					addedColumn.Name, schemaDelta.DstTableName))
+				continue
 			}
 
 			addedColumnBigQueryType := qValueKindToBigQueryTypeString(addedColumn, schemaDelta.NullableEnabled, false)
-			query := c.queryWithLogging(fmt.Sprintf(
-				"ALTER TABLE `%s` ADD COLUMN IF NOT EXISTS `%s` %s",
-				dstDatasetTable.table, addedColumn.Name, addedColumnBigQueryType))
-			query.DefaultProjectID = c.projectID
-			query.DefaultDatasetID = dstDatasetTable.dataset
-			if _, err := query.Read(ctx); err != nil {
-				return fmt.Errorf("failed to add column %s for table %s: %w", addedColumn.Name,
-					schemaDelta.DstTableName, err)
-			}
-			c.logger.Info(fmt.Sprintf("[schema delta replay] added column %s with data type %s to table %s",
-				addedColumn.Name, addedColumnBigQueryType, schemaDelta.DstTableName))
+			addColumnClauses = append(addColumnClauses, fmt.Sprintf("ADD COLUMN IF NOT EXISTS `%s` %s",
+				addedColumn.Name, addedColumnBigQueryType))
+			addedColumnNames = append(addedColumnNames, addedColumn.Name)
 		}
+
+		if len(addColumnClauses) == 0 {
+			continue
+		}
+
+		// Issue a single ALTER TABLE with all added columns instead of one DDL job
+		// per column: BigQuery enforces a low rate limit on table metadata update
+		// operations, and a schema change with several new columns can otherwise
+		// trip that limit.
+		query := c.queryWithLogging(fmt.Sprintf(
+			"ALTER TABLE `%s` %s", dstDatasetTable.table, strings.Join(addColumnClauses, ", ")))
+		query.DefaultProjectID = c.projectID
+		query.DefaultDatasetID = dstDatasetTable.dataset
+
+		ddlCtx, cancel := context.WithTimeout(ctx, schemaDeltaDDLTimeout)
+		_, err = query.Read(ddlCtx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("failed to add columns %v for table %s: %w", addedColumnNames,
+				schemaDelta.DstTableName, err)
+		}
+		c.logger.Info(fmt.Sprintf("[schema delta replay] added columns %v to table %s",
+			addedColumnNames, schemaDelta.DstTableName))
 	}
 
 	return nil
@@ -435,6 +482,12 @@ func (c *BigQueryConnector) NormalizeRecords(ctx context.Context, req *model.Nor
 		unchangedToastMergeChunking = 8
 	}
 
+	geoMakeValid, err := internal.PeerDBBigQueryGeoMakeValid(ctx, req.Env)
+	if err != nil {
+		c.logger.Warn("failed to load PEERDB_BIGQUERY_GEO_MAKE_VALID, continuing with false", slog.Any("error", err))
+		geoMakeValid = false
+	}
+
 	rawTableName := c.getRawTableName(req.FlowJobName)
 
 	normBatchID, err := c.GetLastNormalizeBatchID(ctx, req.FlowJobName)
@@ -454,6 +507,7 @@ func (c *BigQueryConnector) NormalizeRecords(ctx context.Context, req *model.Nor
 		if err := c.mergeTablesInThisBatch(ctx, batchId,
 			req.FlowJobName, rawTableName, req.TableNameSchemaMapping, unchangedToastMergeChunking,
 			&protos.PeerDBColumns{SoftDeleteColName: req.SoftDeleteColName, SyncedAtColName: req.SyncedAtColName},
+			geoMakeValid,
 		); err != nil {
 			return model.NormalizeResponse{}, err
 		}
@@ -487,6 +541,7 @@ func (c *BigQueryConnector) mergeTablesInThisBatch(
 	tableToSchema map[string]*protos.TableSchema,
 	unchangedToastMergeChunking uint32,
 	peerdbColumns *protos.PeerDBColumns,
+	geoMakeValid bool,
 ) error {
 	tableNames, err := c.getDistinctTableNamesInBatch(
 		ctx,
@@ -517,6 +572,7 @@ func (c *BigQueryConnector) mergeTablesInThisBatch(
 		mergeBatchId:       batchId,
 		peerdbCols:         peerdbColumns,
 		shortColumn:        map[string]string{},
+		geoMakeValid:       geoMakeValid,
 	}
 
 	for _, tableName := range tableNames {
@@ -691,6 +747,15 @@ func (c *BigQueryConnector) SetupNormalizedTable(
 				return false, fmt.Errorf("failed to delete table %s: %w", tableIdentifier, deleteErr)
 			}
 		} else {
+			if err := validateCDCJSONPassthroughColumns(
+				tableIdentifier,
+				jsonPassthroughColumnsForDestination(config.TableMappings, tableIdentifier),
+				tableSchema,
+				existingMetadata.Schema,
+			); err != nil {
+				return false, err
+			}
+
 			// table exists, go to next table
 			c.logger.Info("[bigquery] table already exists, skipping",
 				slog.String("table", tableIdentifier),
@@ -767,6 +832,69 @@ func (c *BigQueryConnector) SetupNormalizedTable(
 
 	datasetTablesSet[datasetTable] = struct{}{}
 	return false, nil
+}
+
+func jsonPassthroughColumnsForDestination(
+	tableMappings []*protos.TableMapping,
+	tableIdentifier string,
+) []string {
+	for _, tableMapping := range tableMappings {
+		if tableMapping.DestinationTableIdentifier == tableIdentifier {
+			return tableMapping.JsonPassthroughColumns
+		}
+	}
+	return nil
+}
+
+func validateCDCJSONPassthroughColumns(
+	tableIdentifier string,
+	jsonPassthroughColumns []string,
+	tableSchema *protos.TableSchema,
+	dstSchema bigquery.Schema,
+) error {
+	if len(jsonPassthroughColumns) == 0 {
+		return nil
+	}
+	if tableSchema == nil {
+		return fmt.Errorf("json passthrough configured for table %s but table schema was not found", tableIdentifier)
+	}
+
+	sourceTypes := make(map[string]types.QValueKind, len(tableSchema.Columns))
+	for _, field := range tableSchema.Columns {
+		sourceTypes[field.Name] = types.QValueKind(field.Type)
+	}
+	destinationTypes := make(map[string]bigquery.FieldType, len(dstSchema))
+	for _, field := range dstSchema {
+		destinationTypes[field.Name] = field.Type
+	}
+
+	for _, columnName := range jsonPassthroughColumns {
+		sourceType, ok := sourceTypes[columnName]
+		if !ok {
+			return fmt.Errorf("json passthrough column %s.%s was not found in table schema",
+				tableIdentifier, columnName)
+		}
+		switch sourceType {
+		case types.QValueKindJSON, types.QValueKindJSONB:
+		case types.QValueKindArrayJSON, types.QValueKindArrayJSONB:
+			return fmt.Errorf("json passthrough column %s.%s has unsupported JSON array source type %s",
+				tableIdentifier, columnName, sourceType)
+		default:
+			return fmt.Errorf("json passthrough column %s.%s has non-JSON source type %s",
+				tableIdentifier, columnName, sourceType)
+		}
+
+		destinationType, ok := destinationTypes[columnName]
+		if !ok {
+			return fmt.Errorf("json passthrough column %s.%s was not found in BigQuery destination schema",
+				tableIdentifier, columnName)
+		}
+		if destinationType != bigquery.JSONFieldType {
+			return fmt.Errorf("json passthrough column %s.%s has non-JSON BigQuery destination type %s",
+				tableIdentifier, columnName, destinationType)
+		}
+	}
+	return nil
 }
 
 func (c *BigQueryConnector) SyncFlowCleanup(ctx context.Context, jobName string) error {

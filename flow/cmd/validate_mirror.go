@@ -11,10 +11,10 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/PeerDB-io/peerdb/flow/connectors"
-	"github.com/PeerDB-io/peerdb/flow/generated/proto_conversions"
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	"github.com/PeerDB-io/peerdb/flow/internal"
 	"github.com/PeerDB-io/peerdb/flow/pkg/common"
+	"github.com/PeerDB-io/peerdb/flow/proto_conversions"
 	"github.com/PeerDB-io/peerdb/flow/shared"
 	"github.com/PeerDB-io/peerdb/flow/shared/types"
 )
@@ -44,7 +44,7 @@ func (h *FlowRequestHandler) ValidateCDCMirror(
 			req.ConnectionConfigs.Version = internalVersion
 		}
 	}
-	flowConnectionConfigsCore := proto_conversions.FlowConnectionConfigsToCore(req.ConnectionConfigs, 0)
+	flowConnectionConfigsCore := proto_conversions.FlowConnectionConfigsToCore(req.ConnectionConfigs)
 	return h.validateCDCMirrorImpl(ctx, flowConnectionConfigsCore, false)
 }
 
@@ -123,14 +123,12 @@ func (h *FlowRequestHandler) validateCDCMirrorImpl(
 		if missing, ok := errors.AsType[*common.SourceTablesMissingError](err); ok {
 			return nil, NewFailedPreconditionApiError(
 				missing,
-				NewSourceTableMissingErrorInfo(),
-				NewSourceTableMissingPreconditionFailure(missing.Tables))
+				NewSourceTableMissingErrorDetails(missing.Tables)...)
 		}
 		if notInPub, ok := errors.AsType[*common.TablesNotInPublicationError](err); ok {
 			return nil, NewFailedPreconditionApiError(
 				notInPub,
-				NewTablesNotInPublicationErrorInfo(notInPub.Publication),
-				NewTablesNotInPublicationPreconditionFailure(notInPub.Publication, notInPub.Tables))
+				NewTablesNotInPublicationErrorDetails(notInPub.Publication, notInPub.Tables)...)
 		}
 		if replicaIdErr, ok := errors.AsType[*common.ReplicaIdentifierInUseError](err); ok {
 			// Beyond other PeerDB mirrors, a replica id must not be already

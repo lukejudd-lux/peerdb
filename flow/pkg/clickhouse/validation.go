@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -16,7 +17,6 @@ import (
 	"go.temporal.io/sdk/log"
 
 	"github.com/PeerDB-io/peerdb/flow/pkg/common"
-	"github.com/PeerDB-io/peerdb/flow/pkg/objectstore"
 )
 
 func CheckNotSystemDatabase(database string) error {
@@ -58,10 +58,11 @@ func validateDatabaseEngine(ctx context.Context, logger log.Logger, conn clickho
 func CheckIfClickHouseCloudHasSharedMergeTreeEnabled(ctx context.Context, logger log.Logger,
 	conn clickhouse.Conn,
 ) error {
-	// this is to indicate ClickHouse Cloud service is now creating tables with Shared* by default
+	// cloud_mode_engine 2, 3 and 4 all create tables with Shared* engines by default (3/4 only add
+	// carve-outs for explicit remote disks / Distributed); accept any of them as SMT-enabled
 	var cloudModeEngine bool
 	if err := QueryRow(ctx, logger, conn,
-		"SELECT value='2' AND changed='1' AND readonly='1' FROM system.settings WHERE name = 'cloud_mode_engine'").
+		"SELECT value IN ('2','3','4') AND changed='1' AND readonly='1' FROM system.settings WHERE name = 'cloud_mode_engine'").
 		Scan(&cloudModeEngine); err != nil {
 		return fmt.Errorf("failed to validate cloud_mode_engine setting: %w", err)
 	}
@@ -138,13 +139,53 @@ func ValidateClickHouseHost(ctx context.Context, chHost string, allowedDomainStr
 		chHost, strings.Join(allowedDomains, ","))
 }
 
+func validateStagingAccessGrant(ctx context.Context, logger log.Logger, conn clickhouse.Conn, accessMethod string) error {
+	if accessMethod != "S3" && accessMethod != "URL" {
+		return fmt.Errorf("unsupported ClickHouse staging access method %q", accessMethod)
+	}
+
+	// First check under the new syntax, where the object to check is accessMethod.
+	// Eg. CHECK GRANT READ on S3. This also passes for users holding the legacy
+	// GRANT S3 ON *.* style grant, so a definitive failure here is final.
+	var grantExists bool
+	if err := QueryRow(ctx, logger, conn, "CHECK GRANT READ ON "+accessMethod).Scan(&grantExists); err != nil {
+		// Do not return an error on syntax error; this could mean we're on a
+		// CH version that does not support this syntax.
+		if chException, ok := errors.AsType[*clickhouse.Exception](err); !ok ||
+			chproto.Error(chException.Code) != chproto.ErrSyntaxError {
+			return fmt.Errorf("failed to validate %s read grant: %w", accessMethod, err)
+		}
+		// NB: syntax error falls through to the next check.
+	} else if !grantExists {
+		return fmt.Errorf("failed to validate %s read grant: user lacks READ on %s (fix with GRANT READ ON %s)",
+			accessMethod, accessMethod, accessMethod)
+	} else {
+		// grantExists and no error.
+		return nil
+	}
+	// Now check under the old syntax, where the object to check is *.*.
+	// Eg. CHECK GRANT S3 on *.*.
+	if err := QueryRow(ctx, logger, conn, fmt.Sprintf("CHECK GRANT %s ON *.*", accessMethod)).Scan(&grantExists); err != nil {
+		// Similarly, do not error on syntax errors; instead, just log that the check failed.
+		if chException, ok := errors.AsType[*clickhouse.Exception](err); !ok ||
+			chproto.Error(chException.Code) != chproto.ErrSyntaxError {
+			return fmt.Errorf("failed to validate %s read grant: %w", accessMethod, err)
+		}
+		logger.Warn("[clickhouse] CHECK GRANT not supported by this ClickHouse version, skipping grant validation")
+	} else if !grantExists {
+		return fmt.Errorf("failed to validate %s read grant: user lacks READ on %s (fix with GRANT %s on *.*)",
+			accessMethod, accessMethod, accessMethod)
+	}
+	return nil
+}
+
 func ValidateClickHousePeer(
 	ctx context.Context,
 	logger log.Logger,
 	allowedDomains string,
 	serviceHost string,
 	conn clickhouse.Conn,
-	stagingValidator objectstore.StagingValidator,
+	stagingAccessMethod string,
 ) error {
 	// Hostname validation
 	if err := ValidateClickHouseHost(ctx, serviceHost, allowedDomains); err != nil {
@@ -179,8 +220,8 @@ func ValidateClickHousePeer(
 				if err == nil {
 					break
 				}
-				var chException *clickhouse.Exception
-				if errors.As(err, &chException) && chproto.Error(chException.Code) == chproto.ErrUnfinished {
+				if chException, ok := errors.AsType[*clickhouse.Exception](err); ok &&
+					chproto.Error(chException.Code) == chproto.ErrUnfinished {
 					logger.Warn("validation drop table blocked by in-flight DDL, retrying",
 						slog.String("table", table), slog.Int("attempt", attempt+1))
 					continue
@@ -215,13 +256,180 @@ func ValidateClickHousePeer(
 		return fmt.Errorf("failed to drop validation table %s: %w", validateDummyTableNameRenamed, err)
 	}
 
-	// Staging validation
-
-	// validate staging storage
-	if err := stagingValidator(ctx); err != nil {
-		return fmt.Errorf("failed to validate staging bucket: %w", err)
+	// Validate that ClickHouse has access permissions to the staging access bucket.
+	if err := validateStagingAccessGrant(ctx, logger, conn, stagingAccessMethod); err != nil {
+		return err
 	}
+
 	return nil
+}
+
+// TableCapacityExceededError indicates that a ClickHouse operation would exceed
+// the configured maximum number of attached tables.
+type TableCapacityExceededError struct {
+	CurrentTables            uint64
+	RequiredAdditionalTables uint64
+	MaxTables                uint64
+}
+
+func (e *TableCapacityExceededError) Error() string {
+	return fmt.Sprintf(
+		"ClickHouse table limit would be exceeded: current number of tables is %d, operation requires %d additional table slots, limit is %d",
+		e.CurrentTables,
+		e.RequiredAdditionalTables,
+		e.MaxTables,
+	)
+}
+
+// ValidateTableCapacity checks whether creating the requested tables would
+// exceed max_table_num_to_throw. Existing tables are skipped for ordinary
+// CREATE IF NOT EXISTS operations. During resync, existing tables still need a
+// transient slot because PeerDB uses CREATE OR REPLACE.
+func ValidateTableCapacity(
+	ctx context.Context,
+	logger log.Logger,
+	conn clickhouse.Conn,
+	tableNames []string,
+	extraCount uint64,
+	isResync bool,
+) error {
+	if len(tableNames) == 0 && extraCount == 0 {
+		return nil
+	}
+
+	var maxTables uint64
+	err := QueryRow(ctx, logger, conn,
+		"SELECT toUInt64(getServerSetting('max_table_num_to_throw'))",
+	).Scan(&maxTables)
+	if err != nil {
+		if chException, ok := errors.AsType[*clickhouse.Exception](err); ok &&
+			chproto.Error(chException.Code) == chproto.ErrUnknownFunction {
+			// Older ClickHouse versions do not expose getServerSetting.
+			err = QueryRow(ctx, logger, conn,
+				"SELECT toUInt64(value) FROM system.server_settings WHERE name = 'max_table_num_to_throw'",
+			).Scan(&maxTables)
+			if err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					// Older ClickHouse versions do not expose this setting.
+					return nil
+				}
+				if fallbackException, ok := errors.AsType[*clickhouse.Exception](err); ok &&
+					chproto.Error(fallbackException.Code) == chproto.ErrAccessDenied {
+					logger.Warn("skipping ClickHouse table capacity validation: user cannot read system.server_settings")
+					return nil
+				}
+				return fmt.Errorf("failed to query max_table_num_to_throw: %w", err)
+			}
+		} else {
+			return fmt.Errorf("failed to query max_table_num_to_throw: %w", err)
+		}
+	}
+	if maxTables == 0 {
+		return nil
+	}
+
+	var currentTables uint64
+	if err := QueryRow(ctx, logger, conn,
+		"SELECT toUInt64(value) FROM system.metrics WHERE metric = 'AttachedTable'",
+	).Scan(&currentTables); err != nil {
+		if chException, ok := errors.AsType[*clickhouse.Exception](err); ok &&
+			chproto.Error(chException.Code) == chproto.ErrAccessDenied {
+			logger.Warn("skipping ClickHouse table capacity validation: user cannot read system.metrics")
+			return nil
+		}
+		return fmt.Errorf("failed to query current number of ClickHouse tables: %w", err)
+	}
+
+	existingTables, err := getExistingTables(ctx, logger, conn, tableNames)
+	if err != nil {
+		return err
+	}
+
+	peakTables := projectedPeakTableCount(currentTables, tableNames, existingTables, extraCount, isResync)
+	if peakTables > currentTables && peakTables > maxTables {
+		return &TableCapacityExceededError{
+			CurrentTables:            currentTables,
+			RequiredAdditionalTables: peakTables - currentTables,
+			MaxTables:                maxTables,
+		}
+	}
+
+	return nil
+}
+
+func getExistingTables(
+	ctx context.Context,
+	logger log.Logger,
+	conn clickhouse.Conn,
+	tableNames []string,
+) (map[string]struct{}, error) {
+	uniqueTableNames := make(map[string]struct{}, len(tableNames))
+	for _, tableName := range tableNames {
+		uniqueTableNames[tableName] = struct{}{}
+	}
+
+	existingTables := make(map[string]struct{}, len(uniqueTableNames))
+	quotedTableNames := make([]string, 0, min(len(uniqueTableNames), 200))
+	uniqueNames := slices.Collect(maps.Keys(uniqueTableNames))
+	for chunk := range slices.Chunk(uniqueNames, 200) {
+		quotedTableNames = quotedTableNames[:0]
+		for _, tableName := range chunk {
+			quotedTableNames = append(quotedTableNames, QuoteLiteral(tableName))
+		}
+
+		rows, err := Query(ctx, logger, conn,
+			fmt.Sprintf("SELECT name FROM system.tables WHERE database=currentDatabase() AND name IN (%s)",
+				strings.Join(quotedTableNames, ",")))
+		if err != nil {
+			return nil, fmt.Errorf("failed to query existing ClickHouse tables: %w", err)
+		}
+		for rows.Next() {
+			var tableName string
+			if err := rows.Scan(&tableName); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("failed to scan existing ClickHouse table: %w", err)
+			}
+			existingTables[tableName] = struct{}{}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("failed to read existing ClickHouse tables: %w", err)
+		}
+		rows.Close()
+	}
+
+	return existingTables, nil
+}
+
+func projectedPeakTableCount(
+	currentTables uint64,
+	tableNames []string,
+	existingTables map[string]struct{},
+	extraCount uint64,
+	isResync bool,
+) uint64 {
+	projectedTables := currentTables + extraCount
+	needsTemporarySlot := false
+	for _, tableName := range tableNames {
+		_, exists := existingTables[tableName]
+		if exists {
+			if isResync {
+				needsTemporarySlot = true
+			}
+			continue
+		}
+
+		projectedTables++
+		existingTables[tableName] = struct{}{}
+	}
+
+	if needsTemporarySlot {
+		// Conservatively assume CREATE OR REPLACE runs after all persistent
+		// table creations. It temporarily attaches the replacement before
+		// dropping the existing table.
+		return projectedTables + 1
+	}
+	return projectedTables
 }
 
 type ClickHouseColumn struct {

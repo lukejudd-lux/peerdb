@@ -31,6 +31,15 @@ message ColumnSetting {
   bool nullable_enabled = 5;
 }
 
+// BigqueryCdcEventsFunction selects which BigQuery table-valued function backs
+// EVENTS-mode CDC polling (see BigQueryReplicationMethod) for one table:
+// APPENDS() (insert-only) or CHANGES() (insert/update/delete).
+enum BigqueryCdcEventsFunction {
+  BIGQUERY_CDC_EVENTS_FUNCTION_UNSPECIFIED = 0;
+  BIGQUERY_CDC_EVENTS_FUNCTION_APPENDS = 1;
+  BIGQUERY_CDC_EVENTS_FUNCTION_CHANGES = 2;
+}
+
 message TableMapping {
   string source_table_identifier = 1;
   string destination_table_identifier = 2;
@@ -41,12 +50,31 @@ message TableMapping {
   string sharding_key = 7;
   string policy_name = 8;
   string partition_by_expr = 9;
+  // Only meaningful when the mirror's BigqueryCdcConfig.replication_method is
+  // BIGQUERY_REPLICATION_METHOD_EVENTS.
+  BigqueryCdcEventsFunction bigquery_cdc_events_function = 10;
+  // the column to use as a cursor for query-based CDC replication
+  // required if replication_method is BIGQUERY_REPLICATION_METHOD_QUERY
+  string query_cdc_watermark_column = 11;
+  repeated string json_passthrough_columns = 12;
 }
 
 message SetupInput {
   map<string, string> env = 1;
   string flow_name = 2;
   string peer_name = 3;
+}
+
+enum BigQueryReplicationMethod {
+  BIGQUERY_REPLICATION_METHOD_UNSPECIFIED = 0;
+  // table-valued function (APPENDS()/CHANGES()) based CDC polling.
+  BIGQUERY_REPLICATION_METHOD_EVENTS = 1;
+  // query-based CDC polling. (e.g. SELECT * FROM table WHERE watermark_column > last_watermark)
+  BIGQUERY_REPLICATION_METHOD_QUERY = 2;
+}
+
+message BigqueryCdcConfig {
+  BigQueryReplicationMethod replication_method = 1;
 }
 
 // FlowConnectionConfigs is for external use by the API, maintaining backwards compatibility
@@ -97,12 +125,20 @@ message FlowConnectionConfigs {
   repeated string flags = 27;
 
   optional bool skip_validation = 28;
+
+  // connector-specific mirror config, mirroring Peer's per-connector config oneof
+  oneof source_connector_config {
+    BigqueryCdcConfig bigquery_cdc_config = 29;
+  }
+
+  // query-based CDC: how many source tables are queried and staged concurrently
+  int32 query_cdc_pull_sync_parallelism = 30;
 }
 
 // FlowConnectionConfigsCore is used internally in the codebase, it is safe to remove (mark reserved) fields from it
 // It still needs to be a proto because Temporal
 // When adding fields here, add them to FlowConnectionConfigs too
-// Equivalence with FlowConnectionConfigs is enforced during codegen
+// Equivalence with FlowConnectionConfigs is enforced by flow/proto_conversions tests
 message FlowConnectionConfigsCore {
   reserved 2,3,17;
   string flow_job_name = 1;
@@ -149,6 +185,13 @@ message FlowConnectionConfigsCore {
   repeated string flags = 27;
 
   optional bool skip_validation = 28;
+
+  oneof source_connector_config {
+    BigqueryCdcConfig bigquery_cdc_config = 29;
+  }
+
+  // query-based CDC: how many source tables are queried and staged concurrently
+  int32 query_cdc_pull_sync_parallelism = 30;
 }
 
 message RenameTableOption {
@@ -187,12 +230,11 @@ message CreateTablesFromExistingOutput {
 }
 
 message SyncFlowOptions {
-  reserved 5;
+  reserved 5, 7;
   uint32 batch_size = 1;
   uint64 idle_timeout_seconds = 3;
   map<uint32, string> src_table_id_name_mapping = 4;
   repeated TableMapping table_mappings = 6;
-  int32 number_of_syncs = 7;
 }
 
 message EnsurePullabilityBatchInput {
@@ -254,6 +296,7 @@ message FieldDescription {
   int32 type_modifier = 3;
   bool nullable = 4;
   string type_schema_name = 5;
+  optional string default_expr = 6;
 }
 
 message SetupTableSchemaBatchInput {
@@ -447,6 +490,8 @@ message QRepConfig {
   repeated string flags = 31; // internal
   // if true, then a separate null partition will be created for rows with null values in the watermark column
   bool add_null_partition = 32; // internal
+
+  repeated string json_passthrough_columns = 33;
 }
 
 message ChildTableRange {
@@ -533,10 +578,10 @@ enum FlowStatus {
 }
 
 message CDCFlowConfigUpdate {
+  reserved 4;
   repeated TableMapping additional_tables = 1;
   uint32 batch_size = 2;
   uint64 idle_timeout = 3;
-  int32 number_of_syncs = 4;
   repeated TableMapping removed_tables = 5;
   // updates keys in the env map, existing keys left unchanged
   map<string, string> updated_env = 6;

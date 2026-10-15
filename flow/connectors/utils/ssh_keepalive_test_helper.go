@@ -75,14 +75,12 @@ func RunSSHKeepaliveDownTest(t *testing.T, cfg SSHKeepaliveTestConfig) {
 	t.Log("Disabling proxy to simulate network failure during long-running query")
 	require.NoError(t, cfg.SSHProxy.Disable())
 
-	// Wait for keepalive failure detection (should happen within ~15-20 seconds)
 	t.Log("Waiting for SSH keepalive failure detection...")
 	select {
 	case <-cfg.KeepaliveChan:
 		t.Log("SSH keepalive failure detected successfully")
-		// Channel closing indicates tunnel failure was detected
-	case <-time.After(2 * SSHKeepaliveInterval):
-		t.Fatal("SSH keepalive failure not detected within 2 intervals")
+	case <-time.After(SSHKeepaliveHungTimeout):
+		t.Fatal("SSH keepalive failure not detected in time")
 	}
 
 	// The long-running query should fail due to broken connection
@@ -101,22 +99,19 @@ func RunSSHKeepaliveLatencyTest(t *testing.T, cfg SSHKeepaliveTestConfig) {
 
 	require.NotNil(t, cfg.KeepaliveChan)
 
-	// Add high latency that should cause keepalive timeouts
-	// SSH keepalives happen every 15 seconds, so 25s latency should cause timeout
-	t.Log("Adding latency toxic to cause SSH keepalive timeouts")
+	// 25s of extra latency used to fail the tunnel on the next 15s tick.
+	// A single delayed reply must not take the tunnel down.
+	t.Log("Adding 25s latency toxic; tunnel should stay healthy")
 	_, err := cfg.SSHProxy.AddToxic("latency", "latency", "", 1.0, toxiproxy.Attributes{
 		"latency": 25000, // 25 seconds
 	})
 	require.NoError(t, err, "Failed to add latency toxic")
 
-	// Should detect keepalive failure due to timeout
-	t.Log("Waiting for SSH keepalive timeout...")
 	select {
 	case <-cfg.KeepaliveChan:
-		t.Log("SSH keepalive timeout detected successfully")
-		// Channel closing indicates tunnel timeout was detected
-	case <-time.After(3 * SSHKeepaliveInterval):
-		t.Fatal("SSH keepalive timeout not detected within 3 intervals")
+		t.Fatal("transient SSH latency should not mark the tunnel bad")
+	case <-time.After(4 * SSHKeepaliveInterval):
+		t.Log("tunnel remained healthy through 25s keepalive delay")
 	}
 }
 

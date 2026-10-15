@@ -2,10 +2,12 @@ package utils
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,13 +19,57 @@ import (
 	"github.com/PeerDB-io/peerdb/flow/shared/exceptions"
 )
 
-const SSHKeepaliveInterval = 15 * time.Second
+const (
+	SSHKeepaliveInterval = 15 * time.Second
+	// OpenSSH ClientAliveCountMax default. The jump host (Ubuntu sshd) does not set
+	// ClientAliveInterval, so a single delayed reply is lag, not a dead tunnel.
+	SSHKeepaliveMaxStrikes  = 3
+	SSHKeepaliveHungTimeout = (SSHKeepaliveMaxStrikes + 2) * SSHKeepaliveInterval
+
+	// sshd LoginGraceTime is 120s. Bound the handshake so a hung kex cannot occupy a
+	// MaxStartups slot (bastion is 50:30:200, shared with Fivetran) until then.
+	SSHDialTimeout = 30 * time.Second
+	// sshd TCPKeepAlive is yes; probe faster than the kernel 2h default.
+	SSHTCPKeepaliveInterval = 30 * time.Second
+)
+
+type keepaliveOptions struct {
+	interval   time.Duration
+	maxStrikes int
+	send       func() error
+}
 
 type SSHTunnel struct {
-	*ssh.Client
+	client        *ssh.Client
 	logger        *slog.Logger
 	keepaliveChan atomic.Pointer[chan struct{}]
 	badTunnel     atomic.Bool
+}
+
+// signerCache memoizes parsed SSH signers keyed by a hash of the private key.
+// ssh.ParsePrivateKey runs an RSA precompute (modular exponentiation) that showed
+// up as ~9% of flow-worker CPU because a new connector/tunnel is built for every
+// peer operation. The resulting signer is immutable and safe to reuse across
+// connections, so parse each distinct key once.
+var signerCache sync.Map // map[[32]byte]ssh.Signer
+
+func cachedSigner(privateKeyB64 string) (ssh.Signer, error) {
+	key := sha256.Sum256([]byte(privateKeyB64))
+	if v, ok := signerCache.Load(key); ok {
+		return v.(ssh.Signer), nil
+	}
+
+	pkey, err := base64.StdEncoding.DecodeString(privateKeyB64)
+	if err != nil {
+		return nil, fmt.Errorf("failed to base64 decode private key: %w", err)
+	}
+	signer, err := ssh.ParsePrivateKey(pkey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	actual, _ := signerCache.LoadOrStore(key, signer)
+	return actual.(ssh.Signer), nil
 }
 
 // GetSSHClientConfig returns an *ssh.ClientConfig based on provided credentials.
@@ -37,14 +83,9 @@ func GetSSHClientConfig(config *protos.SSHConfig) (*ssh.ClientConfig, error) {
 
 	// Private key-based authentication
 	if config.PrivateKey != "" {
-		pkey, err := base64.StdEncoding.DecodeString(config.PrivateKey)
+		signer, err := cachedSigner(config.PrivateKey)
 		if err != nil {
-			return nil, fmt.Errorf("failed to base64 decode private key: %w", err)
-		}
-
-		signer, err := ssh.ParsePrivateKey(pkey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %w", err)
+			return nil, err
 		}
 
 		authMethods = append(authMethods, ssh.PublicKeys(signer))
@@ -70,6 +111,7 @@ func GetSSHClientConfig(config *protos.SSHConfig) (*ssh.ClientConfig, error) {
 		User:            config.User,
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
+		Timeout:         SSHDialTimeout,
 	}, nil
 }
 
@@ -87,18 +129,54 @@ func NewSSHTunnel(
 		}
 
 		logger.Info("Setting up SSH connection", slog.String("Server", sshServer))
-		client, err := ssh.Dial("tcp", sshServer, clientConfig)
+		client, err := dialSSH(ctx, sshServer, clientConfig)
 		if err != nil {
 			return nil, exceptions.NewSSHTunnelSetupError(err)
 		}
 
 		return &SSHTunnel{
-			Client: client,
+			client: client,
 			logger: internal.SlogLoggerFromCtx(ctx),
 		}, nil
 	}
 
 	return nil, nil
+}
+
+// dialSSH dials the bastion honoring ctx and bounding both the TCP connect and the
+// SSH handshake. ssh.NewClientConn does NOT honor ClientConfig.Timeout, so without a
+// deadline on the conn a hung kex/auth can hold a bastion MaxStartups slot until
+// sshd's LoginGraceTime. The deadline is cleared once the handshake completes so it
+// does not apply to subsequent tunnel traffic.
+func dialSSH(ctx context.Context, addr string, clientConfig *ssh.ClientConfig) (*ssh.Client, error) {
+	dialer := &net.Dialer{
+		Timeout:   SSHDialTimeout,
+		KeepAlive: SSHTCPKeepaliveInterval,
+	}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	handshakeDeadline := time.Now().Add(SSHDialTimeout)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(handshakeDeadline) {
+		handshakeDeadline = ctxDeadline
+	}
+	if err := conn.SetDeadline(handshakeDeadline); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	clientConn, chans, reqs, err := ssh.NewClientConn(conn, addr, clientConfig)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = clientConn.Close()
+		return nil, err
+	}
+	return ssh.NewClient(clientConn, chans, reqs), nil
 }
 
 // IsBad reports whether the tunnel has been marked unusable (keepalive failure or explicit close).
@@ -107,8 +185,12 @@ func (tunnel *SSHTunnel) IsBad() bool {
 	return tunnel != nil && tunnel.badTunnel.Load()
 }
 
+func (tunnel *SSHTunnel) IsActive() bool {
+	return tunnel != nil && tunnel.client != nil
+}
+
 func (tunnel *SSHTunnel) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	conn, err := tunnel.Client.DialContext(ctx, network, address)
+	conn, err := tunnel.client.DialContext(ctx, network, address)
 	if err != nil {
 		return nil, exceptions.NewSSHTunnelDialError(err)
 	}
@@ -116,76 +198,99 @@ func (tunnel *SSHTunnel) DialContext(ctx context.Context, network, address strin
 }
 
 func (tunnel *SSHTunnel) Close() error {
-	if tunnel != nil && tunnel.Client != nil {
-		if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
-			close(*keepaliveChan)
-		}
-		tunnel.badTunnel.Store(true)
-		return tunnel.Client.Close()
+	if tunnel != nil && tunnel.client != nil {
+		tunnel.markTunnelBad(nil)
+		return tunnel.client.Close()
 	}
 	return nil
+}
+
+func (tunnel *SSHTunnel) closeKeepaliveChan() {
+	if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
+		close(*keepaliveChan)
+	}
+}
+
+func (tunnel *SSHTunnel) markTunnelBad(onFailure func()) {
+	tunnel.closeKeepaliveChan()
+	tunnel.badTunnel.Store(true)
+	if onFailure != nil {
+		onFailure()
+	}
 }
 
 func (tunnel *SSHTunnel) runKeepaliveLoop(
 	ctx context.Context, stopChan <-chan struct{}, onFailure func(),
 ) {
-	ticker := time.NewTicker(SSHKeepaliveInterval)
+	tunnel.runKeepaliveLoopWith(ctx, stopChan, onFailure, keepaliveOptions{
+		interval:   SSHKeepaliveInterval,
+		maxStrikes: SSHKeepaliveMaxStrikes,
+		send: func() error {
+			_, _, err := tunnel.client.SendRequest("keepalive@openssh.com", true, nil)
+			return err
+		},
+	})
+}
+
+func (tunnel *SSHTunnel) runKeepaliveLoopWith(
+	ctx context.Context, stopChan <-chan struct{}, onFailure func(), opts keepaliveOptions,
+) {
+	ticker := time.NewTicker(opts.interval)
 	defer ticker.Stop()
 	logger := tunnel.logger
-	// in case request hangs, we want to detect that and not send another request
+	// in case a request hangs, we count consecutive missed ticks instead of sending another
 	requestSent := atomic.Bool{}
+	var strikes atomic.Int32
 	var keepaliveErr error
-	// closed by request making goroutine to signal error, keepaliveErr
+	// closed once by the request goroutine to signal a hard error, keepaliveErr
 	errChan := make(chan struct{})
+	var errOnce sync.Once
 
 	for {
 		select {
 		case <-ticker.C:
 			if requestSent.Load() {
-				// Previous keepalive request didn't return yet, something's wrong
-				logger.ErrorContext(ctx, "Previous keepalive request still pending, marking tunnel as bad")
-				if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
-					close(*keepaliveChan)
+				n := strikes.Add(1)
+				if int(n) < opts.maxStrikes {
+					logger.WarnContext(ctx, "Keepalive request still pending",
+						slog.Int("strikes", int(n)),
+						slog.Int("maxStrikes", opts.maxStrikes),
+					)
+					continue
 				}
-				tunnel.badTunnel.Store(true)
-				if onFailure != nil {
-					onFailure()
-				}
+				logger.ErrorContext(ctx, "Keepalive request still pending, marking tunnel as bad",
+					slog.Int("strikes", int(n)),
+					slog.Int("maxStrikes", opts.maxStrikes),
+				)
+				tunnel.markTunnelBad(onFailure)
 				return
 			}
+			requestSent.Store(true)
 			go func() {
-				requestSent.Store(true)
-				_, _, err := tunnel.Client.SendRequest("keepalive@openssh.com", true, nil)
-				requestSent.Store(false)
-				if err != nil {
+				if err := opts.send(); err != nil {
 					keepaliveErr = err
-					close(errChan)
+					errOnce.Do(func() { close(errChan) })
+					return
 				}
+				requestSent.Store(false)
+				strikes.Store(0)
 			}()
 		case <-ctx.Done():
-			if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
-				close(*keepaliveChan)
-			}
+			tunnel.closeKeepaliveChan()
 			return
 		case <-stopChan:
 			// channel closed from outside
 			return
 		case <-errChan:
 			logger.ErrorContext(ctx, "Keepalive request failed, marking tunnel as bad", slog.Any("error", keepaliveErr))
-			if keepaliveChan := tunnel.keepaliveChan.Swap(nil); keepaliveChan != nil {
-				close(*keepaliveChan)
-			}
-			tunnel.badTunnel.Store(true)
-			if onFailure != nil {
-				onFailure()
-			}
+			tunnel.markTunnelBad(onFailure)
 			return
 		}
 	}
 }
 
 func (tunnel *SSHTunnel) StartKeepalive(ctx context.Context, onFailure func()) {
-	if tunnel == nil || tunnel.Client == nil || tunnel.badTunnel.Load() {
+	if tunnel == nil || tunnel.client == nil || tunnel.badTunnel.Load() {
 		return
 	}
 	if tunnel.keepaliveChan.Load() != nil {
@@ -201,7 +306,7 @@ func (tunnel *SSHTunnel) StartKeepalive(ctx context.Context, onFailure func()) {
 // returns a channel that is closed if the SSH keepalive fails,
 // or nil if no SSH tunnel is configured
 func (tunnel *SSHTunnel) GetKeepaliveChan(ctx context.Context) <-chan struct{} {
-	if tunnel == nil || tunnel.Client == nil || tunnel.badTunnel.Load() {
+	if tunnel == nil || tunnel.client == nil || tunnel.badTunnel.Load() {
 		// nil channel would be of no consequence in a select
 		// UNLESS it's the only branch in a select, in which case it would block forever
 		return nil

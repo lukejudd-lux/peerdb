@@ -178,12 +178,16 @@ func (h *FlowRequestHandler) cdcFlowStatus(
 		return nil, err
 	}
 
-	initialLoadResponse, apiErr := h.InitialLoadSummary(ctx, &protos.InitialLoadSummaryRequest{
-		ParentMirrorName: req.FlowJobName,
-	})
-	if apiErr != nil {
-		slog.ErrorContext(ctx, "unable to query clone table summary", slog.Any("error", apiErr))
-		return nil, apiErr
+	var snapshotStatus *protos.SnapshotStatus
+	if !req.ExcludeSnapshotStatus {
+		initialLoadResponse, apiErr := h.InitialLoadSummary(ctx, &protos.InitialLoadSummaryRequest{
+			ParentMirrorName: req.FlowJobName,
+		})
+		if apiErr != nil {
+			slog.ErrorContext(ctx, "unable to query clone table summary", slog.Any("error", apiErr))
+			return nil, apiErr
+		}
+		snapshotStatus = &protos.SnapshotStatus{Clones: initialLoadResponse.TableSummaries}
 	}
 
 	var cdcBatches []*protos.CDCBatch
@@ -206,11 +210,9 @@ func (h *FlowRequestHandler) cdcFlowStatus(
 		Config:          config,
 		SourceType:      srcType,
 		DestinationType: dstType,
-		SnapshotStatus: &protos.SnapshotStatus{
-			Clones: initialLoadResponse.TableSummaries,
-		},
-		CdcBatches: cdcBatches,
-		RowsSynced: rowsSynced,
+		SnapshotStatus:  snapshotStatus,
+		CdcBatches:      cdcBatches,
+		RowsSynced:      rowsSynced,
 	}, nil
 }
 
@@ -331,9 +333,8 @@ func (h *FlowRequestHandler) InitialLoadSummary(
 
 	defer rows.Close()
 
-	cloneStatuses := []*protos.CloneTableSummary{}
-	for rows.Next() {
-		if err := rows.Scan(
+	cloneStatuses, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.CloneTableSummary, error) {
+		if err := row.Scan(
 			&flowName,
 			&destinationTable,
 			&sourceTable,
@@ -345,7 +346,7 @@ func (h *FlowRequestHandler) InitialLoadSummary(
 			&numRowsSynced,
 			&avgTimePerPartitionMs,
 		); err != nil {
-			return nil, NewInternalApiError(fmt.Errorf("unable to scan initial load partition - %s: %w", parentMirrorName, err))
+			return nil, err
 		}
 
 		res := &protos.CloneTableSummary{
@@ -392,7 +393,10 @@ func (h *FlowRequestHandler) InitialLoadSummary(
 			res.AvgTimePerPartitionMs = int64(avgTimePerPartitionMs.Float64)
 		}
 
-		cloneStatuses = append(cloneStatuses, res)
+		return res, nil
+	})
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("unable to scan initial load partition - %s: %w", parentMirrorName, err))
 	}
 	return &protos.InitialLoadSummaryResponse{
 		TableSummaries: cloneStatuses,
@@ -430,18 +434,15 @@ func (h *FlowRequestHandler) getPartitionStatuses(
 
 	defer rows.Close()
 
-	res := []*protos.PartitionStatus{}
 	var partitionId pgtype.Text
 	var startTime pgtype.Timestamp
 	var endTime pgtype.Timestamp
 	var numRowsInPartition pgtype.Int8
 	var numRowsSynced pgtype.Int8
 
-	for rows.Next() {
-		if err := rows.Scan(&partitionId, &startTime, &endTime, &numRowsInPartition, &numRowsSynced); err != nil {
-			slog.ErrorContext(ctx, "unable to scan qrep partition",
-				slog.String("flow", flowJobName), slog.Any("error", err))
-			return nil, fmt.Errorf("unable to scan qrep partition - %s: %w", flowJobName, err)
+	res, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.PartitionStatus, error) {
+		if err := row.Scan(&partitionId, &startTime, &endTime, &numRowsInPartition, &numRowsSynced); err != nil {
+			return nil, err
 		}
 
 		partitionStatus := &protos.PartitionStatus{}
@@ -462,7 +463,12 @@ func (h *FlowRequestHandler) getPartitionStatuses(
 			partitionStatus.RowsSynced = numRowsSynced.Int64
 		}
 
-		res = append(res, partitionStatus)
+		return partitionStatus, nil
+	})
+	if err != nil {
+		slog.ErrorContext(ctx, "unable to scan qrep partition",
+			slog.String("flow", flowJobName), slog.Any("error", err))
+		return nil, fmt.Errorf("unable to scan qrep partition - %s: %w", flowJobName, err)
 	}
 
 	return res, nil
@@ -744,6 +750,67 @@ func (h *FlowRequestHandler) CDCTableTotalCounts(
 	}
 
 	return response, nil
+}
+
+func (h *FlowRequestHandler) GetQueryCDCReplicationState(
+	ctx context.Context,
+	req *protos.GetQueryCDCReplicationStateRequest,
+) (*protos.GetQueryCDCReplicationStateResponse, APIError) {
+	rows, err := h.pool.Query(ctx, `SELECT
+			source_table_identifier,
+			cursor_text,
+			last_attempt_at,
+			last_synced_at,
+			synced_batch_id,
+			normalized_batch_id,
+			last_normalized_at,
+			inserts_count,
+			updates_count,
+			deletes_count
+		FROM query_cdc_replication_state
+		WHERE flow_name = $1
+		ORDER BY source_table_identifier`, req.FlowJobName)
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("failed to query table replication state: %w", err))
+	}
+
+	tables, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.QueryCDCReplicationState, error) {
+		var table protos.QueryCDCReplicationState
+		var lastAttemptAt, lastSyncedAt, lastNormalizedAt pgtype.Timestamptz
+		if err := row.Scan(
+			&table.SourceTableIdentifier,
+			&table.CursorText,
+			&lastAttemptAt,
+			&lastSyncedAt,
+			&table.SyncedBatchId,
+			&table.NormalizedBatchId,
+			&lastNormalizedAt,
+			&table.InsertsCount,
+			&table.UpdatesCount,
+			&table.DeletesCount,
+		); err != nil {
+			return nil, NewInternalApiError(fmt.Errorf("failed to scan table replication state: %w", err))
+		}
+		if lastAttemptAt.Valid {
+			table.LastAttemptAt = timestamppb.New(lastAttemptAt.Time)
+		}
+		if lastSyncedAt.Valid {
+			table.LastSyncedAt = timestamppb.New(lastSyncedAt.Time)
+		}
+		if lastNormalizedAt.Valid {
+			table.LastNormalizedAt = timestamppb.New(lastNormalizedAt.Time)
+		}
+		return &table, nil
+	})
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("failed to collect table replication state: %w", err))
+	}
+
+	if tables == nil {
+		tables = []*protos.QueryCDCReplicationState{}
+	}
+
+	return &protos.GetQueryCDCReplicationStateResponse{Tables: tables}, nil
 }
 
 func (h *FlowRequestHandler) ListMirrorNames(
