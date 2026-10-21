@@ -37,17 +37,60 @@ func (c *BigQueryConnector) SyncQRepRecords(
 		return 0, nil, err
 	}
 
+	alignedSchema, err := alignQRepSchemaToSource(tblMetadata.Schema, srcSchema, config.SyncedAtColName, config.SoftDeleteColName)
+	if err != nil {
+		return 0, nil, fmt.Errorf("destination table %s: %w", destTable, err)
+	}
+	alignedMetadata := *tblMetadata
+	alignedMetadata.Schema = alignedSchema
+
 	c.logger.Info(fmt.Sprintf("QRep sync function called and partition existence checked for"+
 		" partition %s of destination table %s",
 		partition.PartitionId, destTable))
 
 	avroSync := NewQRepAvroSyncMethod(c, config.StagingPath, config.FlowJobName)
 	result, err := avroSync.SyncQRepRecords(ctx, config.Env, config.FlowJobName, destTable, partition,
-		tblMetadata, stream, config.SyncedAtColName, config.SoftDeleteColName)
+		&alignedMetadata, stream, config.SyncedAtColName, config.SoftDeleteColName)
 	if err != nil {
 		return result, nil, err
 	}
 	return result, nil, nil
+}
+
+// alignQRepSchemaToSource returns the destination schema reordered to follow the source's columns.
+// The Avro stage is written positionally from source records, so the schema used for the Avro file,
+// the INSERT column list and the select list must follow the source order, matched by name.
+// Without this, a source whose column order differs from the destination table (e.g. a view that was
+// recreated with columns in a different order) either fails on a type mismatch or, when the swapped
+// columns share a type, silently loads values into the wrong columns.
+// Destination columns the source no longer sends are left out of the load, so they land as NULL.
+// The synced-at and soft-delete columns are filled in by the INSERT itself and are kept at the end.
+func alignQRepSchemaToSource(
+	dst bigquery.Schema,
+	src types.QRecordSchema,
+	syncedAtCol string,
+	softDeleteCol string,
+) (bigquery.Schema, error) {
+	aligned := make(bigquery.Schema, 0, len(dst))
+	for _, srcField := range src.Fields {
+		var match *bigquery.FieldSchema
+		for _, dstField := range dst {
+			if strings.EqualFold(srcField.Name, dstField.Name) {
+				match = dstField
+				break
+			}
+		}
+		if match == nil {
+			return nil, fmt.Errorf("source column %s has no matching destination column", srcField.Name)
+		}
+		aligned = append(aligned, match)
+	}
+	for _, dstField := range dst {
+		if (syncedAtCol != "" && dstField.Name == syncedAtCol) || (softDeleteCol != "" && dstField.Name == softDeleteCol) {
+			aligned = append(aligned, dstField)
+		}
+	}
+	return aligned, nil
 }
 
 func (c *BigQueryConnector) replayTableSchemaDeltasQRep(
