@@ -143,10 +143,14 @@ func pullAndSyncCore[TPull connectors.CDCPullConnectorCore, TSync connectors.CDC
 	))
 	defer batchSpan.End()
 
-	tblNameMapping := make(map[string]model.NameAndExclude, len(options.TableMappings))
+	tblNameMapping := make(map[string]model.SourceTableMapping, len(options.TableMappings))
 	for _, v := range options.TableMappings {
-		tblNameMapping[v.SourceTableIdentifier] = model.NewNameAndExclude(
-			v.DestinationTableIdentifier, v.Exclude, v.JsonPassthroughColumns)
+		mapping := model.NewSourceTableMappingWithStructuredIngestion(
+			v.DestinationTableIdentifier, v.Exclude, v.StructuredIngestionConfig,
+		)
+		mapping.MongoConfiguration = v.MongoConfig
+		mapping.JSONPassthroughColumns = model.NewStringSet(v.JsonPassthroughColumns)
+		tblNameMapping[v.SourceTableIdentifier] = mapping
 	}
 
 	destinationType, err := connectors.LoadPeerType(ctx, a.CatalogPool, config.DestinationName)
@@ -635,7 +639,11 @@ func replicateXminPartition[TRead any, TWrite QRepStreamCloser, TSync connectors
 				},
 			}
 		}
-		if err := monitoring.InitializeQRepRun(
+		if err := monitoring.RecordQRepRun(
+			ctx, a.CatalogPool, config, runUUID, config.ParentMirrorName); err != nil {
+			return err
+		}
+		if err := monitoring.RecordQRepPartitions(
 			ctx, logger, a.CatalogPool, config, runUUID, []*protos.QRepPartition{partitionForMetrics}, config.ParentMirrorName,
 		); err != nil {
 			return err
@@ -799,7 +807,6 @@ func (a *FlowableActivity) normalizeLoop(
 	ctx context.Context,
 	logger log.Logger,
 	config *protos.FlowConnectionConfigsCore,
-	syncDone <-chan struct{},
 	normalizeRequests *concurrency.LastChan,
 	normalizeResponses *concurrency.LastChan,
 	normalizingBatchID *atomic.Int64,
@@ -822,9 +829,6 @@ func (a *FlowableActivity) normalizeLoop(
 				return
 			}
 			select {
-			case <-syncDone:
-				logger.Info("[normalize-loop] syncDone closed")
-				return
 			case <-ctx.Done():
 				logger.Info("[normalize-loop] context closed")
 				return
@@ -842,9 +846,6 @@ func (a *FlowableActivity) normalizeLoop(
 				_ = a.Alerter.LogFlowError(ctx, config.FlowJobName, err)
 				// update req to latest normalize request & retry
 				select {
-				case <-syncDone:
-					logger.Info("[normalize-loop] syncDone closed before retry")
-					return
 				case <-ctx.Done():
 					logger.Info("[normalize-loop] context closed before retry")
 					return

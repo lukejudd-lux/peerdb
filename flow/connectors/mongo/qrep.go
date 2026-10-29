@@ -13,6 +13,7 @@ import (
 
 	"github.com/PeerDB-io/peerdb/flow/connectors/utils"
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
+	"github.com/PeerDB-io/peerdb/flow/internal"
 	"github.com/PeerDB-io/peerdb/flow/model"
 	"github.com/PeerDB-io/peerdb/flow/otel_metrics"
 	"github.com/PeerDB-io/peerdb/flow/pkg/common"
@@ -65,7 +66,12 @@ func (c *MongoConnector) GetQRepPartitions(
 		return utils.FullTablePartition(), nil
 	}
 
-	return c.buildPartitions(ctx, collection, adjustedPartitions.AdjustedNumPartitions)
+	sampleObjectIDs, err := internal.PeerDBMongoDBSampledObjectIDPartitioning(ctx, config.Env)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get sampled ObjectID partitioning setting: %w", err)
+	}
+
+	return c.buildPartitions(ctx, collection, adjustedPartitions.AdjustedNumPartitions, sampleObjectIDs)
 }
 
 func (c *MongoConnector) GetDefaultPartitionKeyForTables(
@@ -98,7 +104,26 @@ func (c *MongoConnector) PullQRepRecords(
 	}
 	db := c.client.Database(parseWatermarkTable.Namespace)
 
-	stream.SetSchema(GetDefaultSchema(config.Version))
+	converter := NewDirectBsonConverter()
+	var schema types.QRecordSchema
+	var qValuesFromBsonRaw func(raw bson.Raw) ([]types.QValue, error)
+	structuredCfg := config.StructuredIngestionConfig
+	if structuredCfg.GetEnabled() {
+		projector, err := newStructuredSchemaProjector(config.Columns, config.Exclude, !structuredCfg.GetDropUnexpectedValues())
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed to build structured schema: %w", err)
+		}
+		schema = GetStructuredSchema(projector)
+		qValuesFromBsonRaw = func(raw bson.Raw) ([]types.QValue, error) {
+			return StructuredQValuesFromBsonRaw(raw, config.Version, converter, projector, config.WatermarkTable)
+		}
+	} else {
+		schema = GetDefaultSchema(config.Version)
+		qValuesFromBsonRaw = func(raw bson.Raw) ([]types.QValue, error) {
+			return QValuesFromBsonRaw(raw, config.Version, converter, config.WatermarkTable)
+		}
+	}
+	stream.SetSchema(schema)
 
 	c.totalBytesRead.Store(0)
 	c.deltaBytesRead.Store(0)
@@ -145,9 +170,8 @@ func (c *MongoConnector) PullQRepRecords(
 	}
 	defer cursor.Close(ctx)
 
-	converter := NewDirectBsonConverter()
 	for cursor.Next(ctx) {
-		record, err := QValuesFromBsonRaw(cursor.Current, config.Version, converter, config.WatermarkTable)
+		record, err := qValuesFromBsonRaw(cursor.Current)
 		if err != nil {
 			c.logger.Error("failed to convert record",
 				slog.String("error", err.Error()),
@@ -188,6 +212,15 @@ func (c *MongoConnector) PullQRepRecords(
 	return totalRecords, c.deltaBytesRead.Swap(0), nil
 }
 
+// documentKeyQField is the record field for the document key (`_id`), common to every schema.
+func documentKeyQField() types.QField {
+	return types.QField{
+		Name:     DefaultDocumentKeyColumnName,
+		Type:     types.QValueKindString,
+		Nullable: false,
+	}
+}
+
 func GetDefaultSchema(internalVersion uint32) types.QRecordSchema {
 	fullDocumentColumnName := DefaultFullDocumentColumnName
 	if internalVersion < shared.InternalVersion_MongoDBFullDocumentColumnToDoc {
@@ -195,11 +228,7 @@ func GetDefaultSchema(internalVersion uint32) types.QRecordSchema {
 	}
 	schema := make([]types.QField, 0, 2)
 	schema = append(schema,
-		types.QField{
-			Name:     DefaultDocumentKeyColumnName,
-			Type:     types.QValueKindString,
-			Nullable: false,
-		},
+		documentKeyQField(),
 		types.QField{
 			Name:     fullDocumentColumnName,
 			Type:     types.QValueKindJSON,

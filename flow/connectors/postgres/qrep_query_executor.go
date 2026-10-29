@@ -308,13 +308,18 @@ func (qe *QRepQueryExecutor) processRowsStream(
 		}
 	}
 
+	fastProcessJsonColumns, err := internal.PeerDBPostgresFastProcessJsonColumns(ctx, qe.env)
+	if err != nil {
+		return 0, 0, err
+	}
 	for rows.Next() {
 		if err := ctx.Err(); err != nil {
 			qe.logger.Info("Context canceled, exiting processRowsStream early")
 			return numRows, numBytes, err
 		}
 
-		record, err := qe.mapRowToQRecord(rows, dstType, nullableFields, fieldDescriptions, jsonApi, jsonPassthroughColumns)
+		record, err := qe.mapRowToQRecord(rows, dstType, nullableFields, fieldDescriptions, jsonApi,
+			fastProcessJsonColumns, jsonPassthroughColumns)
 		if err != nil {
 			qe.logger.Error("[pg_query_executor] failed to map row to QRecord", slog.Any("error", err))
 			return numRows, numBytes, fmt.Errorf("failed to map row to QRecord: %w", err)
@@ -563,6 +568,7 @@ func (qe *QRepQueryExecutor) mapRowToQRecord(
 	nullableFields map[string]struct{},
 	fds []pgconn.FieldDescription,
 	jsonApi jsoniter.API,
+	fastProcessJsonColumns bool,
 	jsonPassthroughColumns map[string]struct{},
 ) ([]types.QValue, error) {
 	rawValues := row.RawValues()
@@ -589,13 +595,22 @@ func (qe *QRepQueryExecutor) mapRowToQRecord(
 				}
 				continue
 			}
-			if err := jsonApi.Unmarshal(buf, &values[i]); err != nil {
-				qe.logger.Error("[pg_query_executor] failed to unmarshal json", slog.Any("error", err))
-				return nil, fmt.Errorf("failed to unmarshal json: %w", err)
-			}
-			if values[i] == nil {
-				// avoid confusing SQL null & JSON null by using pre-marshaled value
-				values[i] = json.RawMessage("null")
+			if fastProcessJsonColumns {
+				convertedData, err := convertWithRelaxedNumbers(buf, len(buf))
+				if err != nil {
+					qe.logger.Error("[pg_query_executor] failed to process json", slog.Any("error", err))
+					return nil, fmt.Errorf("failed to process json: %w", err)
+				}
+				values[i] = convertedData
+			} else {
+				if err := jsonApi.Unmarshal(buf, &values[i]); err != nil {
+					qe.logger.Error("[pg_query_executor] failed to unmarshal json", slog.Any("error", err))
+					return nil, fmt.Errorf("failed to unmarshal json: %w", err)
+				}
+				if values[i] == nil {
+					// avoid confusing SQL null & JSON null by using pre-marshaled value
+					values[i] = json.RawMessage("null")
+				}
 			}
 		case pgtype.JSONArrayOID, pgtype.JSONBArrayOID:
 			var textArr pgtype.FlatArray[pgtype.Text]
@@ -604,18 +619,35 @@ func (qe *QRepQueryExecutor) mapRowToQRecord(
 				return nil, fmt.Errorf("failed to scan json array: %w", err)
 			}
 
-			arr := make([]any, len(textArr))
-			for j, text := range textArr {
-				if text.Valid {
-					if err := jsonApi.UnmarshalFromString(text.String, &arr[j]); err != nil {
-						qe.logger.Error("[pg_query_executor] failed to unmarshal json array element", slog.Any("error", err))
-						return nil, fmt.Errorf("failed to unmarshal json array element: %w", err)
+			if fastProcessJsonColumns {
+				arr := make([]preMarshalledJson, len(textArr))
+				for j, text := range textArr {
+					if text.Valid {
+						convertedData, err := convertWithRelaxedNumbers(shared.UnsafeFastStringToReadOnlyBytes(text.String), len(text.String))
+						if err != nil {
+							qe.logger.Error("[pg_query_executor] failed to process json array element", slog.Any("error", err))
+							return nil, fmt.Errorf("failed to process json array element: %w", err)
+						}
+						arr[j] = convertedData
+					} else {
+						arr[j] = nil
 					}
-				} else {
-					arr[j] = nil
 				}
+				values[i] = arr
+			} else {
+				arr := make([]any, len(textArr))
+				for j, text := range textArr {
+					if text.Valid {
+						if err := jsonApi.UnmarshalFromString(text.String, &arr[j]); err != nil {
+							qe.logger.Error("[pg_query_executor] failed to unmarshal json array element", slog.Any("error", err))
+							return nil, fmt.Errorf("failed to unmarshal json array element: %w", err)
+						}
+					} else {
+						arr[j] = nil
+					}
+				}
+				values[i] = arr
 			}
-			values[i] = arr
 
 		default:
 			if dt, ok := qe.conn.TypeMap().TypeForOID(fd.DataTypeOID); ok {

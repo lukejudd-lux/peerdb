@@ -56,7 +56,33 @@ message TableMapping {
   // the column to use as a cursor for query-based CDC replication
   // required if replication_method is BIGQUERY_REPLICATION_METHOD_QUERY
   string query_cdc_watermark_column = 11;
-  repeated string json_passthrough_columns = 12;
+
+  // Structured ingestion settings of the table, if structured ingestion is used.
+  StructuredIngestionTableConfig structured_ingestion_config = 12;
+
+  // MongoDB specific settings of the table, only meaningful when the source is MongoDB.
+  MongoTableConfig mongo_config = 13;
+
+  // Lux fork: json/jsonb columns passed through to BigQuery as raw text. Numbered well clear of
+  // upstream's fields (this was field 12 before v0.37.14-lux, which upstream now uses).
+  repeated string json_passthrough_columns = 1001;
+}
+
+message MongoTableConfig {
+  // If true, delete events carry the document as it stood immediately before the delete
+  // (the change stream's `fullDocumentBeforeChange`) instead of only its `_id`, so the
+  // destination row of a delete keeps the document's values rather than defaults.
+  // Requires `changeStreamPreAndPostImages` to be enabled on the source collection.
+  bool delete_preimage = 1;
+}
+
+message StructuredIngestionTableConfig {
+  // If true, the mirror will use structured ingestion for the mapped table,
+  // using the column types given by the `columns` (`destination_type`) field in the TableMapping.
+  bool enabled = 1;
+  // If true, when structured ingestion is enabled, reports of unfitting values will not include
+  // the values themselves, just their field and why they did not fit.
+  bool drop_unexpected_values = 2;
 }
 
 message SetupInput {
@@ -73,8 +99,24 @@ enum BigQueryReplicationMethod {
   BIGQUERY_REPLICATION_METHOD_QUERY = 2;
 }
 
+message QueryCdcConfig {
+  // how many source tables are queried and staged concurrently
+  int32 pull_sync_parallelism = 1;
+
+  // delay the upper bound of each query window behind source's clock
+  int32 safety_lag_seconds = 2;
+
+  // maximum duration covered by a single pull query
+  int32 max_query_window_seconds = 3;
+
+  // standard 5-field cron expression (UTC), e.g. "0 * * * *" for every hour sharp.
+  // When set, polls run on this schedule instead of every sync interval.
+  string sync_cron = 4;
+}
+
 message BigqueryCdcConfig {
   BigQueryReplicationMethod replication_method = 1;
+  QueryCdcConfig query_cdc = 2;
 }
 
 // FlowConnectionConfigs is for external use by the API, maintaining backwards compatibility
@@ -131,8 +173,8 @@ message FlowConnectionConfigs {
     BigqueryCdcConfig bigquery_cdc_config = 29;
   }
 
-  // query-based CDC: how many source tables are queried and staged concurrently
-  int32 query_cdc_pull_sync_parallelism = 30;
+  // Deprecated: use BigqueryCdcConfig.query_cdc.pull_sync_parallelism instead.
+  int32 query_cdc_pull_sync_parallelism = 30 [deprecated = true];
 }
 
 // FlowConnectionConfigsCore is used internally in the codebase, it is safe to remove (mark reserved) fields from it
@@ -190,8 +232,8 @@ message FlowConnectionConfigsCore {
     BigqueryCdcConfig bigquery_cdc_config = 29;
   }
 
-  // query-based CDC: how many source tables are queried and staged concurrently
-  int32 query_cdc_pull_sync_parallelism = 30;
+  // Deprecated: use BigqueryCdcConfig.query_cdc.pull_sync_parallelism instead.
+  int32 query_cdc_pull_sync_parallelism = 30 [deprecated = true];
 }
 
 message RenameTableOption {
@@ -490,8 +532,12 @@ message QRepConfig {
   repeated string flags = 31; // internal
   // if true, then a separate null partition will be created for rows with null values in the watermark column
   bool add_null_partition = 32; // internal
+  // Structured ingestion settings of the replicated table, unset for tables that do not use it.
+  StructuredIngestionTableConfig structured_ingestion_config = 33;
 
-  repeated string json_passthrough_columns = 33;
+  // Lux fork: json/jsonb columns passed through to BigQuery as raw text. Numbered well clear of
+  // upstream's fields (this was field 33 before v0.37.14-lux, which upstream now uses).
+  repeated string json_passthrough_columns = 1001;
 }
 
 message ChildTableRange {
@@ -590,6 +636,10 @@ message CDCFlowConfigUpdate {
   uint32 snapshot_max_parallel_workers = 8;
   uint32 snapshot_num_tables_in_parallel = 9;
   bool skip_initial_snapshot_for_table_additions = 11;
+  // removes keys from the env map, applied after updated_env
+  repeated string removed_env = 12;
+  // Replaces the QueryCdcConfig settings when present. An absent message leaves them unchanged.
+  QueryCdcConfig query_cdc = 13;
 }
 
 message QRepFlowConfigUpdate {
@@ -606,7 +656,7 @@ message SetupFlowOutput {
   map<uint32, string> src_table_id_name_mapping = 1;
 }
 
-message AddTablesToPublicationInput {
+message AddTablesToReplicationInput {
   string flow_job_name = 1;
   string publication_name = 2;
   repeated TableMapping additional_tables = 3;

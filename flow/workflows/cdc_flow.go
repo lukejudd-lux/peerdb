@@ -120,11 +120,16 @@ func processCDCFlowConfigUpdate(
 		SnapshotMaxParallelWorkers:    state.SnapshotMaxParallelWorkers,
 		SnapshotNumTablesInParallel:   state.SnapshotNumTablesInParallel,
 	}
-	if len(flowConfigUpdate.UpdatedEnv) > 0 {
-		oldValues.Env = make(map[string]string, len(flowConfigUpdate.UpdatedEnv))
+	if len(flowConfigUpdate.UpdatedEnv) > 0 || len(flowConfigUpdate.RemovedEnv) > 0 {
+		oldValues.Env = make(map[string]string, len(flowConfigUpdate.UpdatedEnv)+len(flowConfigUpdate.RemovedEnv))
 		if cfg.Env != nil {
 			for key := range flowConfigUpdate.UpdatedEnv {
 				oldValues.Env[key] = cfg.Env[key]
+			}
+			for _, key := range flowConfigUpdate.RemovedEnv {
+				if value, ok := cfg.Env[key]; ok {
+					oldValues.Env[key] = value
+				}
 			}
 		}
 	}
@@ -135,12 +140,8 @@ func processCDCFlowConfigUpdate(
 	if flowConfigUpdate.IdleTimeout > 0 {
 		state.SyncFlowOptions.IdleTimeoutSeconds = flowConfigUpdate.IdleTimeout
 	}
-	if flowConfigUpdate.UpdatedEnv != nil {
-		if cfg.Env == nil {
-			cfg.Env = make(map[string]string, len(flowConfigUpdate.UpdatedEnv))
-		}
-		maps.Copy(cfg.Env, flowConfigUpdate.UpdatedEnv)
-	}
+	cfg.Env = applyEnvUpdate(cfg.Env, flowConfigUpdate.UpdatedEnv, flowConfigUpdate.RemovedEnv)
+	applyQueryCDCConfigUpdate(cfg, flowConfigUpdate.QueryCdc)
 	if flowConfigUpdate.SnapshotNumRowsPerPartition > 0 {
 		state.SnapshotNumRowsPerPartition = flowConfigUpdate.SnapshotNumRowsPerPartition
 	}
@@ -185,6 +186,26 @@ func processCDCFlowConfigUpdate(
 	telemetry.LogActivityUpdateFlowConfig(context.Background(), cfg.FlowJobName, oldValues, flowConfigUpdate)
 	syncStateToConfigProtoInCatalog(ctx, cfg, state)
 	return nextRunNone, nil
+}
+
+func applyQueryCDCConfigUpdate(cfg *protos.FlowConnectionConfigsCore, update *protos.QueryCdcConfig) {
+	if update == nil || cfg.GetBigqueryCdcConfig() == nil {
+		return
+	}
+	cfg.GetBigqueryCdcConfig().QueryCdc = proto.CloneOf(update)
+}
+
+func applyEnvUpdate(env map[string]string, updatedEnv map[string]string, removedEnv []string) map[string]string {
+	if len(updatedEnv) > 0 {
+		if env == nil {
+			env = make(map[string]string, len(updatedEnv))
+		}
+		maps.Copy(env, updatedEnv)
+	}
+	for _, key := range removedEnv {
+		delete(env, key)
+	}
+	return env
 }
 
 func processTerminate(
@@ -514,11 +535,13 @@ func addCdcPropertiesSignalListener(
 		// do this irrespective of additional tables being present, for auto unpausing
 		state.FlowConfigUpdate = cdcConfigUpdate
 		logger.Info("CDC Signal received",
-			slog.Uint64("BatchSize", uint64(state.SyncFlowOptions.BatchSize)),
-			slog.Uint64("IdleTimeout", state.SyncFlowOptions.IdleTimeoutSeconds),
+			slog.Uint64("BatchSize", uint64(cdcConfigUpdate.BatchSize)),
+			slog.Uint64("IdleTimeout", cdcConfigUpdate.IdleTimeout),
 			slog.Any("AdditionalTables", cdcConfigUpdate.AdditionalTables),
 			slog.Any("RemovedTables", cdcConfigUpdate.RemovedTables),
 			slog.Any("UpdatedEnv", cdcConfigUpdate.UpdatedEnv),
+			slog.Any("RemovedEnv", cdcConfigUpdate.RemovedEnv),
+			slog.Any("QueryCdc", cdcConfigUpdate.QueryCdc),
 			slog.Uint64("SnapshotNumRowsPerPartition", uint64(cdcConfigUpdate.SnapshotNumRowsPerPartition)),
 			slog.Uint64("SnapshotNumPartitionsOverride", uint64(cdcConfigUpdate.SnapshotNumPartitionsOverride)),
 			slog.Uint64("SnapshotMaxParallelWorkers", uint64(cdcConfigUpdate.SnapshotMaxParallelWorkers)),

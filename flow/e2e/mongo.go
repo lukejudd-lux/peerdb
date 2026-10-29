@@ -28,6 +28,10 @@ type MongoSource struct {
 	adminClient *mongo.Client
 }
 
+func (s *MongoSource) Config() *protos.MongoConfig {
+	return s.config
+}
+
 func (s *MongoSource) GeneratePeer(t *testing.T) *protos.Peer {
 	t.Helper()
 	peer := &protos.Peer{
@@ -117,7 +121,7 @@ func SetupMongo(t *testing.T, suffix string) (*MongoSource, error) {
 		DisableTls: true,
 	}
 
-	mongoConn, err := connmongo.NewMongoConnector(t.Context(), mongoConfig)
+	mongoConn, err := connmongo.NewMongoConnector(t.Context(), nil, mongoConfig)
 	require.NoError(t, err, "failed to setup mongo connector")
 
 	testDb := GetTestDatabase(suffix)

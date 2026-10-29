@@ -219,9 +219,14 @@ func (h *FlowRequestHandler) cdcFlowStatus(
 // returns truncation, tick size, & number of ticks
 func getGraphParams(aggType protos.TimeAggregateType, mode protos.GraphMode) (string, string, int) {
 	switch aggType {
+	case protos.TimeAggregateType_TIME_AGGREGATE_TYPE_ONE_MIN:
+		if mode == protos.GraphMode_GRAPH_MODE_LAST_X {
+			return "minute", "1 minute", 1
+		}
+		return "minute", "1 minute", 30
 	case protos.TimeAggregateType_TIME_AGGREGATE_TYPE_FIVE_MIN:
 		if mode == protos.GraphMode_GRAPH_MODE_LAST_X {
-			return "1 minute", "minute", 5
+			return "minute", "1 minute", 5
 		}
 		return "minute", "5 minutes", 30
 	case protos.TimeAggregateType_TIME_AGGREGATE_TYPE_FIFTEEN_MIN:
@@ -291,6 +296,46 @@ func (h *FlowRequestHandler) CDCGraph(ctx context.Context, req *protos.GraphRequ
 	}, nil
 }
 
+func (h *FlowRequestHandler) CDCLagGraph(ctx context.Context, req *protos.GraphRequest) (*protos.LagGraphResponse, APIError) {
+	truncUnit, tickInterval, numberOfTicks := getGraphParams(req.AggregateType, req.Mode)
+	// same formulas as the source/destination/e2e lag otel gauges, from the batch's first row
+	rows, err := h.pool.Query(ctx, `
+		SELECT tm,
+			MAX(EXTRACT(EPOCH FROM first_row_received_at - first_row_commit_time) * 1000)::float8,
+			MAX(EXTRACT(EPOCH FROM end_time - first_row_received_at) * 1000)::float8,
+			MAX(EXTRACT(EPOCH FROM end_time - first_row_commit_time) * 1000)::float8
+		FROM generate_series(
+			date_trunc($2, now() - $1::INTERVAL * $3),
+			now(),
+			$1::INTERVAL
+		) tm
+		LEFT JOIN peerdb_stats.cdc_batches
+			ON end_time >= tm AND end_time < tm + $1::INTERVAL
+			AND flow_name = $4
+			AND first_row_received_at IS NOT NULL
+		GROUP BY 1
+		ORDER BY 1
+	`, tickInterval, truncUnit, numberOfTicks, req.FlowJobName)
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("failed to query cdc lag graph: %w", err))
+	}
+
+	data, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (*protos.LagGraphResponseItem, error) {
+		var t time.Time
+		item := &protos.LagGraphResponseItem{}
+		if err := row.Scan(&t, &item.SourceLagMs, &item.DestinationLagMs, &item.E2ELagMs); err != nil {
+			return nil, err
+		}
+		item.Time = float64(t.UnixMilli())
+		return item, nil
+	})
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("failed to collect cdc lag graph: %w", err))
+	}
+
+	return &protos.LagGraphResponse{Data: data}, nil
+}
+
 func (h *FlowRequestHandler) InitialLoadSummary(
 	ctx context.Context,
 	req *protos.InitialLoadSummaryRequest,
@@ -310,7 +355,7 @@ func (h *FlowRequestHandler) InitialLoadSummary(
 		AVG(EXTRACT(EPOCH FROM (qp.end_time - qp.start_time)) * 1000) FILTER (WHERE qp.end_time IS NOT NULL) AS AvgTimePerPartitionMs
 	FROM peerdb_stats.qrep_partitions qp
 	RIGHT JOIN peerdb_stats.qrep_runs qr ON qp.flow_name = qr.flow_name
-	WHERE qr.parent_mirror_name = $1
+	WHERE qr.parent_mirror_name = $1 AND NOT qr.failed
 	GROUP BY qr.flow_name, qr.destination_table, qr.source_table, qr.start_time, qr.fetch_complete, qr.consolidate_complete;
 	`
 	var flowName pgtype.Text
@@ -695,6 +740,20 @@ func (h *FlowRequestHandler) CDCTableTotalCounts(
 	ctx context.Context,
 	req *protos.CDCTableTotalCountsRequest,
 ) (*protos.CDCTableTotalCountsResponse, APIError) {
+	config, err := h.getFlowConfigFromCatalog(ctx, req.FlowJobName)
+	if err != nil {
+		return nil, NewInternalApiError(fmt.Errorf("unable to get flow config: %w", err))
+	}
+	if config.GetBigqueryCdcConfig() != nil {
+		state, apiErr := h.GetQueryCDCReplicationState(ctx, &protos.GetQueryCDCReplicationStateRequest{
+			FlowJobName: req.FlowJobName,
+		})
+		if apiErr != nil {
+			return nil, apiErr
+		}
+		return queryCDCTableTotalCounts(state.Tables, config.TableMappings), nil
+	}
+
 	rows, err := h.pool.Query(ctx, `SELECT
 			destination_table_name,
 			inserts_count,
@@ -750,6 +809,46 @@ func (h *FlowRequestHandler) CDCTableTotalCounts(
 	}
 
 	return response, nil
+}
+
+func queryCDCTableTotalCounts(
+	tables []*protos.QueryCDCReplicationState,
+	mappings []*protos.TableMapping,
+) *protos.CDCTableTotalCountsResponse {
+	destinations := make(map[string]string, len(mappings))
+	for _, mapping := range mappings {
+		destinations[mapping.SourceTableIdentifier] = mapping.DestinationTableIdentifier
+	}
+
+	response := &protos.CDCTableTotalCountsResponse{
+		TotalData:  &protos.CDCRowCounts{},
+		TablesData: make([]*protos.CDCTableRowCounts, 0, len(tables)),
+	}
+	for _, table := range tables {
+		counts := &protos.CDCRowCounts{
+			InsertsCount: table.InsertsCount,
+			UpdatesCount: table.UpdatesCount,
+			DeletesCount: table.DeletesCount,
+		}
+		counts.TotalCount = counts.InsertsCount + counts.UpdatesCount + counts.DeletesCount
+
+		tableName := destinations[table.SourceTableIdentifier]
+		if tableName == "" {
+			tableName = table.SourceTableIdentifier
+		}
+		response.TablesData = append(response.TablesData, &protos.CDCTableRowCounts{
+			TableName: tableName,
+			Counts:    counts,
+		})
+		response.TotalData.TotalCount += counts.TotalCount
+		response.TotalData.InsertsCount += counts.InsertsCount
+		response.TotalData.UpdatesCount += counts.UpdatesCount
+		response.TotalData.DeletesCount += counts.DeletesCount
+	}
+	slices.SortFunc(response.TablesData, func(a, b *protos.CDCTableRowCounts) int {
+		return strings.Compare(a.TableName, b.TableName)
+	})
+	return response
 }
 
 func (h *FlowRequestHandler) GetQueryCDCReplicationState(

@@ -96,13 +96,9 @@ func (c *ClickHouseConnector) generateCreateTableSQLForNormalizedTable(
 	var engine string
 	tmEngine := protos.TableEngine_CH_ENGINE_REPLACING_MERGE_TREE
 
-	var tableMapping *protos.TableMapping
-	for _, tm := range config.TableMappings {
-		if tm.DestinationTableIdentifier == tableIdentifier {
-			tmEngine = tm.Engine
-			tableMapping = tm
-			break
-		}
+	tableMapping := findTableMappingByDestination(config.TableMappings, tableIdentifier)
+	if tableMapping != nil {
+		tmEngine = tableMapping.Engine
 	}
 
 	isDeletedColumn := defaultIsDeletedColName
@@ -187,25 +183,14 @@ func (c *ClickHouseConnector) generateCreateTableSQLForNormalizedTable(
 
 		for _, column := range tableSchema.Columns {
 			colName := column.Name
-			dstColName := colName
 			colType := types.QValueKind(column.Type)
-			var columnNullableEnabled bool
-			var clickHouseType string
-			if tableMapping != nil {
-				for _, col := range tableMapping.Columns {
-					if col.SourceName == colName {
-						if col.DestinationName != "" {
-							dstColName = col.DestinationName
-							colNameMap[colName] = dstColName
-						}
-						if col.DestinationType != "" {
-							clickHouseType = col.DestinationType
-						}
-						columnNullableEnabled = col.NullableEnabled
-						break
-					}
-				}
+			colSetting := findColumnSetting(colName, tableMapping.GetColumns())
+			dstColName := resolveDestinationColumnName(colName, tableMapping.GetColumns())
+			if dstColName != colName {
+				colNameMap[colName] = dstColName
 			}
+			clickHouseType := colSetting.GetDestinationType()
+			columnNullableEnabled := colSetting.GetNullableEnabled()
 
 			if clickHouseType == "" {
 				var err error
@@ -216,7 +201,8 @@ func (c *ClickHouseConnector) generateCreateTableSQLForNormalizedTable(
 				if err != nil {
 					return nil, fmt.Errorf("error while converting column type to ClickHouse type: %w", err)
 				}
-			} else if (tableSchema.NullableEnabled || columnNullableEnabled) && column.Nullable && !colType.IsArray() {
+			} else if (tableSchema.NullableEnabled || columnNullableEnabled) && column.Nullable && !colType.IsArray() &&
+				!strings.HasPrefix(clickHouseType, "Nullable(") {
 				clickHouseType = fmt.Sprintf("Nullable(%s)", clickHouseType)
 			}
 

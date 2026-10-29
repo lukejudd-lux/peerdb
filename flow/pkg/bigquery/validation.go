@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"cloud.google.com/go/bigquery"
+	storageapi "cloud.google.com/go/bigquery/storage/apiv1"
+	"cloud.google.com/go/bigquery/storage/apiv1/storagepb"
 	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
 
@@ -151,13 +153,13 @@ func GetTables(
 	return result, nil
 }
 
-// ReplicationMode selects how CDC events are produced for a BigQuery source mirror.
-type ReplicationMode int
+// ReplicationMethod selects how CDC events are produced for a BigQuery source mirror.
+type ReplicationMethod int
 
 const (
-	ReplicationModeUnspecified ReplicationMode = iota
-	ReplicationModeEvents
-	ReplicationModeQuery
+	ReplicationMethodUnspecified ReplicationMethod = iota
+	ReplicationMethodEvents
+	ReplicationMethodQuery
 )
 
 // CDCEventsFunction selects which BigQuery CDC function backs a table's events.
@@ -173,7 +175,7 @@ const (
 type SourceTableConfig struct {
 	// SourceTableIdentifier is "table", "dataset.table", or "project.dataset.table".
 	SourceTableIdentifier string
-	// WatermarkColumn is required when the mirror's ReplicationMode is ReplicationModeQuery.
+	// WatermarkColumn is required when the mirror's ReplicationMethod is ReplicationMethodQuery.
 	WatermarkColumn string
 	// Include, if non-empty, restricts replication to these column names
 	// ("selected_columns"). Mutually exclusive with Exclude.
@@ -196,13 +198,14 @@ type SourceTableConfig struct {
 //
 //nolint:govet // logically grouped, fieldalignment confuses things
 type SourceConfig struct {
-	Client        *bigquery.Client
-	StorageClient *storage.Client
-	ProjectID     string
+	Client            *bigquery.Client
+	StorageClient     *storage.Client
+	StorageReadClient *storageapi.BigQueryReadClient
+	ProjectID         string
 	// DefaultDataset is used for table identifiers with no dataset qualifier.
-	DefaultDataset  string
-	Tables          []SourceTableConfig
-	ReplicationMode ReplicationMode
+	DefaultDataset    string
+	Tables            []SourceTableConfig
+	ReplicationMethod ReplicationMethod
 	// HasSnapshot enables validation of snapshot staging access and export
 	// permissions using SnapshotStagingPath.
 	HasSnapshot         bool
@@ -453,11 +456,15 @@ func validateSourceCDC(ctx context.Context, cfg SourceConfig, tablesByKey map[Da
 		}
 	}
 
+	if err := validateStorageReadAPI(ctx, cfg); err != nil {
+		return err
+	}
+
 	for i, t := range cfg.Tables {
 		key := validateTables[i]
 
-		switch cfg.ReplicationMode {
-		case ReplicationModeQuery:
+		switch cfg.ReplicationMethod {
+		case ReplicationMethodQuery:
 			if t.WatermarkColumn == "" {
 				return fmt.Errorf("table %q has no watermark_column configured; QUERY replication mode requires "+
 					"one TIMESTAMP column per table to incrementally scan", key)
@@ -475,7 +482,7 @@ func validateSourceCDC(ctx context.Context, cfg SourceConfig, tablesByKey map[Da
 				return fmt.Errorf("watermark column %q on table %q must be TIMESTAMP, got %s",
 					t.WatermarkColumn, key, column.Type)
 			}
-		case ReplicationModeEvents:
+		case ReplicationMethodEvents:
 			switch t.CDCEventsFunction {
 			case CDCEventsFunctionChanges:
 				if !tablesByKey[key].HasPrimaryKey() && !t.HasOrderingKey {
@@ -500,5 +507,36 @@ func validateSourceCDC(ctx context.Context, cfg SourceConfig, tablesByKey map[Da
 		}
 	}
 
+	return nil
+}
+
+// validateStorageReadAPI creates a read session for the first source table to
+// verify that the BigQuery Storage Read API is enabled and accessible. Creating
+// the session does not read any table data.
+func validateStorageReadAPI(ctx context.Context, cfg SourceConfig) error {
+	if len(cfg.Tables) == 0 {
+		return nil
+	}
+	if cfg.StorageReadClient == nil {
+		return errors.New("BigQuery Storage Read client is required when the Storage Read API is enabled")
+	}
+
+	key, err := ResolveDatasetTable(cfg.Tables[0].SourceTableIdentifier, cfg.DefaultDataset)
+	if err != nil {
+		return err
+	}
+	_, err = cfg.StorageReadClient.CreateReadSession(ctx, &storagepb.CreateReadSessionRequest{
+		Parent: "projects/" + cfg.ProjectID,
+		ReadSession: &storagepb.ReadSession{
+			Table:      fmt.Sprintf("projects/%s/datasets/%s/tables/%s", cfg.ProjectID, key.Dataset, key.Table),
+			DataFormat: storagepb.DataFormat_ARROW,
+		},
+		MaxStreamCount: 1,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to validate BigQuery Storage Read API: %w; enable the API by following %s",
+			&ExternalError{err},
+			"https://docs.cloud.google.com/bigquery/docs/reference/storage#enabling_the_api")
+	}
 	return nil
 }

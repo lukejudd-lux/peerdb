@@ -36,6 +36,10 @@ type ClickHouseSuite struct {
 	cluster   bool
 }
 
+func (s ClickHouseSuite) S3Helper() *S3TestHelper {
+	return s.s3Helper
+}
+
 func (s ClickHouseSuite) T() *testing.T {
 	return s.t
 }
@@ -54,6 +58,14 @@ func (s ClickHouseSuite) DestinationConnector() connectors.Connector {
 
 func (s ClickHouseSuite) Suffix() string {
 	return s.suffix
+}
+
+func (s ClickHouseSuite) IsCluster() bool {
+	return s.cluster
+}
+
+func (s ClickHouseSuite) Catalog() shared.CatalogPool {
+	return s.catalog
 }
 
 func (s ClickHouseSuite) Peer() *protos.Peer {
@@ -164,8 +176,11 @@ func (s ClickHouseSuite) GetRows(table string, cols string) (*model.QRecordBatch
 	if strings.HasPrefix(table, "_peerdb_raw") {
 		rows, rowsErr = s.queryRawTable(ch, table, cols)
 	} else {
+		// Remove this setting once clickhouse-go supports ClickHouse 26.10+ native JSON serialization.
 		rows, rowsErr = ch.Query(
-			s.t.Context(),
+			clickhouse.Context(s.t.Context(), clickhouse.WithSettings(clickhouse.Settings{
+				"output_format_native_use_flattened_dynamic_and_json_serialization": 1,
+			})),
 			fmt.Sprintf(`SELECT %s FROM "%s" FINAL WHERE _peerdb_is_deleted = 0 ORDER BY 1 SETTINGS use_query_cache = false`, cols, table),
 		)
 	}
@@ -386,6 +401,25 @@ func (s ClickHouseSuite) GetRows(table string, cols string) (*model.QRecordBatch
 	return batch, rows.Err()
 }
 
+// GetColumnType returns the ClickHouse type of a column on a destination table as reported by system.columns.
+func (s ClickHouseSuite) GetColumnType(table string, column string) (string, error) {
+	ch, err := connclickhouse.Connect(s.t.Context(), nil, s.Peer().GetClickhouseConfig())
+	if err != nil {
+		return "", err
+	}
+	defer ch.Close()
+
+	var columnType string
+	err = ch.QueryRow(s.t.Context(),
+		"SELECT type FROM system.columns WHERE database = $1 AND table = $2 AND name = $3",
+		s.connector.Config.Database, table, column,
+	).Scan(&columnType)
+	if err != nil {
+		return "", fmt.Errorf("failed to look up type of %s.%s: %w", table, column, err)
+	}
+	return columnType, nil
+}
+
 // CountNonDeletedRows returns the number of rows in table where _peerdb_is_deleted = 0.
 // Unlike GetRows it does not use FINAL, so it works for engines that reject FINAL (e.g. MergeTree).
 func (s ClickHouseSuite) CountNonDeletedRows(table string) (int, error) {
@@ -406,6 +440,31 @@ func (s ClickHouseSuite) queryRawTable(conn clickhouse.Conn, table string, cols 
 		s.t.Context(),
 		fmt.Sprintf(`SELECT %s FROM "%s" ORDER BY 1 SETTINGS use_query_cache = false`, cols, table),
 	)
+}
+
+// CreateSlowInsertViaMV attaches a materialized view to tableName that makes every insert into it takes sleepSeconds
+func (s ClickHouseSuite) CreateSlowInsertViaMV(tableName string, sleepSeconds int) (func(), error) {
+	ch, err := connclickhouse.Connect(s.t.Context(), nil, s.Peer().GetClickhouseConfig())
+	if err != nil {
+		return nil, err
+	}
+	mvName := fmt.Sprintf(`"%s_slow_insert_mv"`, tableName)
+	if err := ch.Exec(s.t.Context(), fmt.Sprintf(
+		`CREATE MATERIALIZED VIEW %s ENGINE = Null AS SELECT * FROM "%s"
+		WHERE 0 IN (SELECT number FROM numbers(%d) WHERE sleepEachRow(1) = 0 SETTINGS max_block_size = 1)`,
+		mvName, tableName, sleepSeconds)); err != nil {
+		ch.Close()
+		return nil, err
+	}
+	cleanup := func() {
+		defer ch.Close()
+		rows, err := ch.Query(s.t.Context(), fmt.Sprintf(
+			`KILL QUERY WHERE current_database = currentDatabase() AND query ILIKE 'INSERT INTO%%%s%%' SYNC`, tableName))
+		require.NoError(s.t, err)
+		rows.Close()
+		require.NoError(s.t, ch.Exec(s.t.Context(), "DROP VIEW IF EXISTS "+mvName))
+	}
+	return cleanup, nil
 }
 
 func SetupClickHouseSuite[TSource SuiteSource](

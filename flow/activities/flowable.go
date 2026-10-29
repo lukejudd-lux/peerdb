@@ -460,9 +460,6 @@ func (a *FlowableActivity) syncFlowSharedStream(
 		return a.Alerter.LogFlowError(ctx, config.FlowJobName, err)
 	}
 
-	// syncDone is closed by SyncFlow to signal the normalize goroutine that no more batches
-	// are coming, whereas normDone is closed by the normalize goroutine upon exit.
-	syncDone := make(chan struct{})
 	normDone := make(chan struct{})
 	normRequests := concurrency.NewLastChan()
 	normResponses := concurrency.NewLastChan()
@@ -491,10 +488,11 @@ func (a *FlowableActivity) syncFlowSharedStream(
 	// Normalize is always 1 batch behind, allow 2 to still run in parallel with pull-sync
 	normBufferSize = max(normBufferSize, 2)
 
+	normCtx, cancelNormCtx := context.WithCancel(internal.WithOperationContext(ctx, protos.FlowOperation_FLOW_OPERATION_NORMALIZE))
+	defer cancelNormCtx()
 	go func() {
 		defer close(normDone)
-		normalizeCtx := internal.WithOperationContext(ctx, protos.FlowOperation_FLOW_OPERATION_NORMALIZE)
-		a.normalizeLoop(normalizeCtx, logger, config, syncDone, normRequests, normResponses, &normalizingBatchID, &normalizeWaiting)
+		a.normalizeLoop(normCtx, logger, config, normRequests, normResponses, &normalizingBatchID, &normalizeWaiting)
 	}()
 
 	var syncErr error
@@ -528,7 +526,7 @@ func (a *FlowableActivity) syncFlowSharedStream(
 	}
 
 	syncState.Store(new("cleanup"))
-	close(syncDone)
+	cancelNormCtx()
 	normRequests.Close()
 	normResponses.Close()
 	<-normDone
@@ -631,6 +629,11 @@ func (a *FlowableActivity) SetupQRepMetadataTables(ctx context.Context, config *
 	return nil
 }
 
+func (a *FlowableActivity) InitializeQRepRun(ctx context.Context, config *protos.QRepConfig, runUUID string) error {
+	ctx = context.WithValue(ctx, shared.FlowNameKey, config.FlowJobName)
+	return monitoring.RecordQRepRun(ctx, a.CatalogPool, config, runUUID, config.ParentMirrorName)
+}
+
 // GetQRepPartitions returns the partitions for a given QRepConfig.
 func (a *FlowableActivity) GetQRepPartitions(ctx context.Context,
 	config *protos.QRepConfig,
@@ -644,9 +647,6 @@ func (a *FlowableActivity) GetQRepPartitions(ctx context.Context,
 
 	ctx = context.WithValue(ctx, shared.FlowNameKey, config.FlowJobName)
 	logger := log.With(internal.LoggerFromCtx(ctx), slog.String(string(shared.FlowNameKey), config.FlowJobName))
-	if err := monitoring.InitializeQRepRun(ctx, logger, a.CatalogPool, config, runUUID, nil, config.ParentMirrorName); err != nil {
-		return nil, err
-	}
 	srcConn, srcClose, err := connectors.GetByNameAs[connectors.QRepPullConnectorCore](ctx, config.Env, a.CatalogPool, config.SourceName)
 	if err != nil {
 		return nil, a.Alerter.LogFlowError(ctx, config.FlowJobName, fmt.Errorf("failed to get qrep pull connector: %w", err))
@@ -686,7 +686,7 @@ func (a *FlowableActivity) GetQRepPartitions(ctx context.Context,
 				return nil, fmt.Errorf("failed to offload partition ranges: %w", err)
 			}
 		}
-		if err := monitoring.InitializeQRepRun(
+		if err := monitoring.RecordQRepPartitions(
 			ctx,
 			logger,
 			a.CatalogPool,
@@ -871,6 +871,15 @@ func initializeReplicatePartitionFunc(
 	default:
 		return nil, fmt.Errorf("unsupported QRepSyncConnectorCore type %T", qRepPullCoreConn)
 	}
+}
+
+// MarkQRepRunFailed records a qrep workflow failure against its run in peerdb_stats.qrep_runs
+// so the run is excluded from the initial load summary instead of showing as in progress forever.
+func (a *FlowableActivity) MarkQRepRunFailed(ctx context.Context, config *protos.QRepConfig,
+	runUUID string,
+) error {
+	ctx = context.WithValue(ctx, shared.FlowNameKey, config.FlowJobName)
+	return monitoring.MarkQRepRunFailed(ctx, a.CatalogPool, runUUID)
 }
 
 func (a *FlowableActivity) ConsolidateQRepPartitions(ctx context.Context, config *protos.QRepConfig,
@@ -1088,6 +1097,11 @@ func (a *FlowableActivity) ScheduledTasks(ctx context.Context) error {
 			telemetry.LogPeerInfo(ctx, peer, version, variant)
 			for _, entry := range peerFlowEntries {
 				entry.FlowConfig.ReplicationMechanismInUse = replicationMechanismInUseByFlow[entry.FlowConfig.FlowName]
+				if peer.Type == protos.DBType_POSTGRES {
+					if enabled, err := internal.PeerDBPostgresEnableFailoverSlots(ctx, entry.Env); err == nil {
+						entry.FlowConfig.FailoverSlotsEnabled = &enabled
+					}
+				}
 			}
 		}
 		telemetry.LogFlowConfigs(ctx, flowConfigsForLogging)
@@ -1895,16 +1909,20 @@ func (a *FlowableActivity) ReplicateXminPartition(ctx context.Context,
 	}
 }
 
+// AddTablesToPublication sets up replication of tables added to a running mirror on
+// any source that needs it. It keeps its original name because
+// that is the activity type recorded in the history of running workflows.
 func (a *FlowableActivity) AddTablesToPublication(ctx context.Context, cfg *protos.FlowConnectionConfigsCore,
 	additionalTableMappings []*protos.TableMapping,
 ) error {
 	shutdown := common.HeartbeatRoutine(ctx, func() string {
-		return "adding tables to publication"
+		return "adding tables to replication"
 	})
 	defer shutdown()
 
 	ctx = context.WithValue(ctx, shared.FlowNameKey, cfg.FlowJobName)
-	srcConn, srcClose, err := connectors.GetByNameAs[*connpostgres.PostgresConnector](ctx, cfg.Env, a.CatalogPool, cfg.SourceName)
+	srcConn, srcClose, err := connectors.GetByNameAs[connectors.TableAdditionSourceConnector](
+		ctx, cfg.Env, a.CatalogPool, cfg.SourceName)
 	if err != nil {
 		if errors.Is(err, errors.ErrUnsupported) {
 			return nil
@@ -1913,7 +1931,7 @@ func (a *FlowableActivity) AddTablesToPublication(ctx context.Context, cfg *prot
 	}
 	defer srcClose(ctx)
 
-	if err := srcConn.AddTablesToPublication(ctx, &protos.AddTablesToPublicationInput{
+	if err := srcConn.AddTablesToReplication(ctx, &protos.AddTablesToReplicationInput{
 		FlowJobName:      cfg.FlowJobName,
 		PublicationName:  cfg.PublicationName,
 		AdditionalTables: additionalTableMappings,
@@ -1921,8 +1939,8 @@ func (a *FlowableActivity) AddTablesToPublication(ctx context.Context, cfg *prot
 		return a.Alerter.LogFlowError(ctx, cfg.FlowJobName, err)
 	}
 
-	a.Alerter.LogFlowInfo(ctx, cfg.FlowJobName, fmt.Sprintf("ensured %d tables exist in publication %s",
-		len(additionalTableMappings), cfg.PublicationName))
+	a.Alerter.LogFlowInfo(ctx, cfg.FlowJobName, fmt.Sprintf("set up replication for %d additional tables",
+		len(additionalTableMappings)))
 	return nil
 }
 

@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -282,27 +285,27 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		TargetForSetting: protos.DynconfTarget_BIGQUERY,
 	},
 	{
-		Name: "PEERDB_BIGQUERY_CDC_SAFETY_LAG_SECONDS",
-		Description: "BigQuery CDC only: keeps a poll window's upper bound this many seconds behind BigQuery's " +
-			"clock, since APPENDS()/CHANGES() consistency for very recent writes is undocumented",
+		Name: "PEERDB_QUERY_CDC_SAFETY_LAG_SECONDS",
+		Description: "Query-based CDC only: keeps a poll window's upper bound this many seconds behind the " +
+			"source clock",
 		DefaultValue:     "60",
 		ValueType:        protos.DynconfValueType_INT,
-		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
 		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
 	},
 	{
-		Name: "PEERDB_BIGQUERY_CDC_MAX_QUERY_WINDOW_SECONDS",
-		Description: "BigQuery CDC only: caps how much time a single APPENDS()/CHANGES() poll can cover, " +
-			"bounding one BigQuery job's row-scan cost even if a mirror falls far behind",
+		Name: "PEERDB_QUERY_CDC_MAX_QUERY_WINDOW_SECONDS",
+		Description: "Query-based CDC only: caps how much time a single pull query can cover, " +
+			"bounding one query's row-scan cost even if a mirror falls far behind",
 		DefaultValue:     "86400",
 		ValueType:        protos.DynconfValueType_INT,
-		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
 		TargetForSetting: protos.DynconfTarget_CLICKHOUSE,
 	},
 	{
 		Name: "PEERDB_QUERY_CDC_PULL_SYNC_PARALLELISM",
 		Description: "Query-based CDC only: default for how many source tables are queried and staged concurrently, " +
-			"used when a mirror does not set query_cdc_pull_sync_parallelism; 0 or less removes the limit",
+			"used when a mirror does not set query_cdc.pull_sync_parallelism; 0 or less removes the limit",
 		DefaultValue:     "10",
 		ValueType:        protos.DynconfValueType_INT,
 		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
@@ -493,6 +496,15 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		TargetForSetting: protos.DynconfTarget_ALL,
 	},
 	{
+		Name: "PEERDB_UI_STRUCTURED_INGESTION_ENABLED",
+		Description: "Enable/disable configuring structured ingestion from PeerDB UI, which projects documents from schemaless " +
+			"sources onto typed columns instead of landing them whole in a single JSON column.",
+		DefaultValue:     "false",
+		ValueType:        protos.DynconfValueType_BOOL,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_ALL,
+	},
+	{
 		Name:             "PEERDB_POSTGRES_ENABLE_FAILOVER_SLOTS",
 		Description:      "Create slots with failover enabled when possible",
 		DefaultValue:     "false",
@@ -576,6 +588,15 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		TargetForSetting: protos.DynconfTarget_ALL,
 	},
 	{
+		Name: "PEERDB_MONGODB_SAMPLED_OBJECTID_PARTITIONING",
+		Description: "Controls whether MongoDB ObjectID _id snapshot partitions use sampled boundaries instead of " +
+			"an even split of the min-max _id range",
+		DefaultValue:     "true",
+		ValueType:        protos.DynconfValueType_BOOL,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_ALL,
+	},
+	{
 		Name: "PEERDB_POSTGRES_RAW_BATCH_CLEANUP_THRESHOLD",
 		Description: "Number of normalized batches to retain in raw table. After normalize, batches older " +
 			"than normalize_batch_id minus this value are deleted. 0 disables cleanup",
@@ -583,6 +604,34 @@ var DynamicSettings = [...]*protos.DynamicSetting{
 		ValueType:        protos.DynconfValueType_INT,
 		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
 		TargetForSetting: protos.DynconfTarget_POSTGRES,
+	},
+	{
+		Name:             "PEERDB_MONGODB_NUM_PARALLEL_DECODE_THREADS",
+		Description:      "Number of parallel threads to use when decoding full BSON documents in MongoDB change events.",
+		DefaultValue:     "1",
+		ValueType:        protos.DynconfValueType_INT,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
+		TargetForSetting: protos.DynconfTarget_ALL,
+	},
+	{
+		Name: "PEERDB_MONGODB_LOG_COMMANDS",
+		Description: "Log metadata for each MongoDB command sent during CDC, for debugging in production. " +
+			"This setting increases log volume significantly and can overload the logging pipeline. Disable it when debugging is complete.",
+		DefaultValue:     "false",
+		ValueType:        protos.DynconfValueType_BOOL,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_AFTER_RESUME,
+		TargetForSetting: protos.DynconfTarget_ALL,
+	},
+	{
+		Name: "PEERDB_POSTGRES_FAST_PROCESS_JSON_COLUMNS",
+		Description: "Process JSON/JSONB columns by iterating on JSON tokens instead of a full " +
+			"unmarshal/marshal roundtrip. Faster as it avoids wasted CPU cycles on a full JSON " +
+			"marshal/unmarshal, and it still converts out-of-float64-range numbers to strings like the " +
+			"classic path.",
+		DefaultValue:     "true",
+		ValueType:        protos.DynconfValueType_BOOL,
+		ApplyMode:        protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE,
+		TargetForSetting: protos.DynconfTarget_ALL,
 	},
 	{
 		Name:             "PEERDB_BIGQUERY_GEO_MAKE_VALID",
@@ -614,6 +663,35 @@ var DynamicIndex = func() map[string]int {
 	return defaults
 }()
 
+func ValidateEnv(env map[string]string) error {
+	var errs []error
+	for _, key := range slices.Sorted(maps.Keys(env)) {
+		idx, ok := DynamicIndex[key]
+		if !ok {
+			errs = append(errs, fmt.Errorf("%s is not a known setting", key))
+			continue
+		}
+		value := env[key]
+		var err error
+		switch DynamicSettings[idx].ValueType {
+		case protos.DynconfValueType_INT:
+			_, err = strconv.ParseInt(value, 10, 64)
+		case protos.DynconfValueType_UINT:
+			_, err = strconv.ParseUint(value, 10, 64)
+		case protos.DynconfValueType_BOOL:
+			_, err = strconv.ParseBool(value)
+		case protos.DynconfValueType_STRING:
+		default:
+			err = fmt.Errorf("unsupported value type %s", DynamicSettings[idx].ValueType)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: invalid value %q for %s setting: %w",
+				key, value, strings.ToLower(DynamicSettings[idx].ValueType.String()), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 type BinaryFormat int
 
 const (
@@ -623,8 +701,29 @@ const (
 	BinaryFormatHex
 )
 
+// env maps are shared across goroutines within an activity (e.g. pull/sync/normalize),
+// and dynLookup writes resolved values back into them
+// untangling the configs and doing explicit caching / intentional write-back would be better
+// but life is short
+var envMu sync.RWMutex
+
+func envGet(env map[string]string, key string) (string, bool) {
+	envMu.RLock()
+	defer envMu.RUnlock()
+	val, ok := env[key]
+	return val, ok
+}
+
+func envSetIfMissing(env map[string]string, key string, val string) {
+	envMu.Lock()
+	defer envMu.Unlock()
+	if _, ok := env[key]; !ok {
+		env[key] = val
+	}
+}
+
 func dynLookup(ctx context.Context, env map[string]string, key string) (string, error) {
-	if val, ok := env[key]; ok {
+	if val, ok := envGet(env, key); ok {
 		return val, nil
 	}
 
@@ -648,19 +747,19 @@ func dynLookup(ctx context.Context, env map[string]string, key string) (string, 
 	if !value.Valid {
 		if val, ok := os.LookupEnv(key); ok {
 			if env != nil && setting != nil && setting.ApplyMode != protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE {
-				env[key] = val
+				envSetIfMissing(env, key, val)
 			}
 			return val, nil
 		}
 		if setting != nil {
 			if env != nil && setting.ApplyMode != protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE {
-				env[key] = setting.DefaultValue
+				envSetIfMissing(env, key, setting.DefaultValue)
 			}
 			return setting.DefaultValue, nil
 		}
 	}
 	if env != nil && setting != nil && setting.ApplyMode != protos.DynconfApplyMode_APPLY_MODE_IMMEDIATE {
-		env[key] = value.String
+		envSetIfMissing(env, key, value.String)
 	}
 	return value.String, nil
 }
@@ -753,16 +852,16 @@ func PeerDBBigQueryToastMergeChunking(ctx context.Context, env map[string]string
 	return dynamicConfUnsigned[uint32](ctx, env, "PEERDB_BIGQUERY_TOAST_MERGE_CHUNKING")
 }
 
-func PeerDBBigQueryCDCSafetyLag(ctx context.Context, env map[string]string) (time.Duration, error) {
-	x, err := dynamicConfSigned[int64](ctx, env, "PEERDB_BIGQUERY_CDC_SAFETY_LAG_SECONDS")
+func PeerDBQueryCDCSafetyLag(ctx context.Context, env map[string]string) (time.Duration, error) {
+	x, err := dynamicConfSigned[int64](ctx, env, "PEERDB_QUERY_CDC_SAFETY_LAG_SECONDS")
 	if err != nil {
 		return 0, err
 	}
 	return time.Duration(x) * time.Second, nil
 }
 
-func PeerDBBigQueryCDCMaxQueryWindow(ctx context.Context, env map[string]string) (time.Duration, error) {
-	x, err := dynamicConfSigned[int64](ctx, env, "PEERDB_BIGQUERY_CDC_MAX_QUERY_WINDOW_SECONDS")
+func PeerDBQueryCDCMaxQueryWindow(ctx context.Context, env map[string]string) (time.Duration, error) {
+	x, err := dynamicConfSigned[int64](ctx, env, "PEERDB_QUERY_CDC_MAX_QUERY_WINDOW_SECONDS")
 	if err != nil {
 		return 0, err
 	}
@@ -823,6 +922,10 @@ func PeerDBQueueFlushTimeoutSeconds(ctx context.Context, env map[string]string) 
 
 func PeerDBQueueParallelism(ctx context.Context, env map[string]string) (int64, error) {
 	return dynamicConfSigned[int64](ctx, env, "PEERDB_QUEUE_PARALLELISM")
+}
+
+func PeerDBUIStructuredIngestionEnabled(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_UI_STRUCTURED_INGESTION_ENABLED")
 }
 
 func PeerDBCDCStoreEnabled(ctx context.Context, env map[string]string) (bool, error) {
@@ -1057,6 +1160,22 @@ func PeerDBMongoDBExcludedOperationTypes(ctx context.Context, env map[string]str
 	return ops, nil
 }
 
+func PeerDBMongoDBSampledObjectIDPartitioning(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_MONGODB_SAMPLED_OBJECTID_PARTITIONING")
+}
+
 func PeerDBPostgresRawBatchCleanupThreshold(ctx context.Context, env map[string]string) (int64, error) {
 	return dynamicConfSigned[int64](ctx, env, "PEERDB_POSTGRES_RAW_BATCH_CLEANUP_THRESHOLD")
+}
+
+func PeerDBMongoDBNumParallelDecodeThreads(ctx context.Context, env map[string]string) (int64, error) {
+	return dynamicConfSigned[int64](ctx, env, "PEERDB_MONGODB_NUM_PARALLEL_DECODE_THREADS")
+}
+
+func PeerDBMongoDBLogCommands(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_MONGODB_LOG_COMMANDS")
+}
+
+func PeerDBPostgresFastProcessJsonColumns(ctx context.Context, env map[string]string) (bool, error) {
+	return dynamicConfBool(ctx, env, "PEERDB_POSTGRES_FAST_PROCESS_JSON_COLUMNS")
 }

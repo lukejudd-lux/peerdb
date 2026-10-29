@@ -166,8 +166,8 @@ func TestCDCDecodeJSONPassthroughPreservesRawNestedJSON(t *testing.T) {
 func TestValidateCDCJSONPassthroughConfig(t *testing.T) {
 	t.Parallel()
 
-	tableMapping := map[string]model.NameAndExclude{
-		"public.events": model.NewNameAndExclude("dataset.events", nil, []string{"payload"}),
+	tableMapping := map[string]model.SourceTableMapping{
+		"public.events": model.SourceTableMapping{Name: "dataset.events", JSONPassthroughColumns: model.NewStringSet([]string{"payload"})},
 	}
 
 	tests := []struct {
@@ -247,7 +247,7 @@ func TestValidateCDCJSONPassthroughConfig(t *testing.T) {
 func TestShouldPassthroughJSONColumnOIDValidation(t *testing.T) {
 	t.Parallel()
 
-	nameAndExclude := model.NewNameAndExclude("dataset.events", nil, []string{"payload"})
+	nameAndExclude := model.SourceTableMapping{Name: "dataset.events", JSONPassthroughColumns: model.NewStringSet([]string{"payload"})}
 
 	tests := []struct {
 		name            string
@@ -319,7 +319,7 @@ func TestShouldPassthroughJSONColumnDefaultOn(t *testing.T) {
 	t.Parallel()
 
 	// Empty allowlist — rely entirely on the default-on behavior.
-	nameAndExclude := model.NewNameAndExclude("dataset.events", nil)
+	nameAndExclude := model.NewSourceTableMapping("dataset.events", nil)
 
 	tests := []struct {
 		name            string

@@ -47,7 +47,7 @@ type PostgresCDCSource struct {
 	*PostgresConnector
 	srcTableIDNameMapping  map[uint32]string
 	schemaNameForRelID     map[uint32]string
-	tableNameMapping       map[string]model.NameAndExclude
+	tableNameMapping       map[string]model.SourceTableMapping
 	tableNameSchemaMapping map[string]*protos.TableSchema
 	relationMessageMapping model.RelationMessageMapping
 	slot                   string
@@ -57,7 +57,9 @@ type PostgresCDCSource struct {
 	// for partitioned tables, maps child relid to parent relid
 	childToParentRelIDMapping map[uint32]uint32
 	idToRelKindMap            map[uint32]byte
-	publishViaPartitionRoot   bool
+	// relids of the tables in the mirror, the only candidates a child can be remapped to
+	mirroredRelIDs          []uint32
+	publishViaPartitionRoot bool
 
 	// for storing schema delta audit logs to catalog
 	catalogPool                              shared.CatalogPool
@@ -68,6 +70,7 @@ type PostgresCDCSource struct {
 	jsonApi                                  jsoniter.API
 	destinationType                          protos.DBType
 	flowJobName                              string
+	fastProcessJsonColumns                   bool
 	handleInheritanceForNonPartitionedTables bool
 	originMetadataAsDestinationColumn        bool
 	jsonPassthroughDefault                   bool
@@ -84,12 +87,13 @@ type PostgresCDCConfig struct {
 	CatalogPool                              shared.CatalogPool
 	OtelManager                              *otel_metrics.OtelManager
 	SrcTableIDNameMapping                    map[uint32]string
-	TableNameMapping                         map[string]model.NameAndExclude
+	TableNameMapping                         map[string]model.SourceTableMapping
 	TableNameSchemaMapping                   map[string]*protos.TableSchema
 	RelationMessageMapping                   model.RelationMessageMapping
 	FlowJobName                              string
 	Slot                                     string
 	Publication                              string
+	FastProcessJsonColumns                   bool
 	HandleInheritanceForNonPartitionedTables bool
 	SourceSchemaAsDestinationColumn          bool
 	OriginMetaAsDestinationColumn            bool
@@ -140,9 +144,9 @@ func (c *PostgresConnector) queryPostgresClockOffset(ctx context.Context) (time.
 
 // Create a new PostgresCDCSource
 func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig *PostgresCDCConfig) (*PostgresCDCSource, error) {
+	mirroredRelIDs := slices.Collect(maps.Keys(cdcConfig.SrcTableIDNameMapping))
 	childToParentRelIDMap, idToRelKindMap, err := getChildToParentRelIDMap(ctx,
-		c.conn, slices.Collect(maps.Keys(cdcConfig.SrcTableIDNameMapping)),
-		cdcConfig.HandleInheritanceForNonPartitionedTables)
+		c.conn, mirroredRelIDs, cdcConfig.HandleInheritanceForNonPartitionedTables)
 	if err != nil {
 		return nil, fmt.Errorf("error getting child to parent relid map: %w", err)
 	}
@@ -189,6 +193,7 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		commitLock:                               nil,
 		childToParentRelIDMapping:                childToParentRelIDMap,
 		idToRelKindMap:                           idToRelKindMap,
+		mirroredRelIDs:                           mirroredRelIDs,
 		publishViaPartitionRoot:                  publishViaPartitionRoot,
 		catalogPool:                              cdcConfig.CatalogPool,
 		alerter:                                  alerting.NewAlerter(ctx, cdcConfig.CatalogPool, cdcConfig.OtelManager),
@@ -198,6 +203,7 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		jsonApi:                                  jsonApi,
 		destinationType:                          cdcConfig.DestinationType,
 		flowJobName:                              cdcConfig.FlowJobName,
+		fastProcessJsonColumns:                   cdcConfig.FastProcessJsonColumns,
 		handleInheritanceForNonPartitionedTables: cdcConfig.HandleInheritanceForNonPartitionedTables,
 		originMetadataAsDestinationColumn:        cdcConfig.OriginMetaAsDestinationColumn,
 		jsonPassthroughDefault:                   cdcConfig.JSONPassthroughDefault,
@@ -221,23 +227,42 @@ func (p *PostgresCDCSource) getSourceSchemaForDestinationColumn(relID uint32, ta
 	return schemaTable.Namespace, nil
 }
 
+// inheritanceParentRelkinds lists the relkinds a parent may have for its children to be remapped onto it:
+// partitioned tables always, plain tables only when inheritance handling is enabled.
+func inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables bool) string {
+	if handleInheritanceForNonPartitionedTables {
+		return "'p', 'r'"
+	}
+	return "'p'"
+}
+
+// childToParentRelIDMapQuery and inheritedParentQuery must agree on which parent a child is remapped to:
+// candidates are the mirrored tables ($1 / $2) with a qualifying relkind, and the one with the lowest
+// inhseqno wins. The startup map and runtime discovery would otherwise route a child of several mirrored
+// parents differently across pulls.
+func childToParentRelIDMapQuery(handleInheritanceForNonPartitionedTables bool) string {
+	return fmt.Sprintf(`
+		SELECT DISTINCT ON (i.inhrelid) i.inhparent AS parentrelid, i.inhrelid AS childrelid, parent.relkind
+		FROM pg_inherits i
+		JOIN pg_class parent ON i.inhparent = parent.oid
+		WHERE parent.relkind IN (%s) AND i.inhparent = ANY($1)
+		ORDER BY i.inhrelid, i.inhseqno`, inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables))
+}
+
+func inheritedParentQuery(handleInheritanceForNonPartitionedTables bool) string {
+	return fmt.Sprintf(`
+		SELECT i.inhparent, parent.relkind
+		FROM pg_inherits i
+		JOIN pg_class parent ON i.inhparent = parent.oid
+		WHERE i.inhrelid = $1 AND parent.relkind IN (%s) AND i.inhparent = ANY($2)
+		ORDER BY i.inhseqno
+		LIMIT 1`, inheritanceParentRelkinds(handleInheritanceForNonPartitionedTables))
+}
+
 func getChildToParentRelIDMap(ctx context.Context,
 	conn *pgx.Conn, parentTableOIDs []uint32, handleInheritanceForNonPartitionedTables bool,
 ) (map[uint32]uint32, map[uint32]byte, error) {
-	relkinds := "'p'"
-	if handleInheritanceForNonPartitionedTables {
-		relkinds = "'p', 'r'"
-	}
-
-	query := fmt.Sprintf(`
-		SELECT parent.oid AS parentrelid, child.oid AS childrelid, parent.relkind
-		FROM pg_inherits
-		JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
-		JOIN pg_class child ON pg_inherits.inhrelid = child.oid
-		WHERE parent.relkind IN (%s) AND parent.oid=ANY($1);
-	`, relkinds)
-
-	rows, err := conn.Query(ctx, query, parentTableOIDs)
+	rows, err := conn.Query(ctx, childToParentRelIDMapQuery(handleInheritanceForNonPartitionedTables), parentTableOIDs)
 	if err != nil {
 		return nil, nil, fmt.Errorf("error querying for child to parent relid map: %w", err)
 	}
@@ -385,7 +410,7 @@ func validateJSONPassthroughTableSchema(tableSchema *protos.TableSchema, tableNa
 
 func validateCDCJSONPassthroughConfig(
 	destinationType protos.DBType,
-	tableNameMapping map[string]model.NameAndExclude,
+	tableNameMapping map[string]model.SourceTableMapping,
 	tableNameSchemaMapping map[string]*protos.TableSchema,
 ) error {
 	for sourceTableName, nameAndExclude := range tableNameMapping {
@@ -409,7 +434,7 @@ func validateCDCJSONPassthroughConfig(
 }
 
 func (p *PostgresCDCSource) shouldPassthroughJSONColumn(
-	nameAndExclude model.NameAndExclude,
+	nameAndExclude model.SourceTableMapping,
 	col *pglogrepl.RelationMessageColumn,
 ) (bool, error) {
 	_, explicit := nameAndExclude.JSONPassthroughColumns[col.Name]
@@ -462,7 +487,7 @@ func processTuple[Items model.Items](
 	p *PostgresCDCSource,
 	tuple *pglogrepl.TupleData,
 	rel *pglogrepl.RelationMessage,
-	nameAndExclude model.NameAndExclude,
+	sourceTableMapping model.SourceTableMapping,
 	customTypeMapping map[uint32]pkg_pg.CustomDataType,
 	schemaName string,
 	baseRecord model.BaseRecord,
@@ -475,21 +500,23 @@ func processTuple[Items model.Items](
 	items := processor.NewItems(len(tuple.Columns))
 	var unchangedToastColumns map[string]struct{}
 
+	// pgoutput writes the RelationMessage attributes and every tuple with the same column filter, so any
+	// difference means the tuple would be decoded against the wrong layout
 	var none Items
-	if len(tuple.Columns) > len(rel.Columns) {
+	if len(tuple.Columns) != len(rel.Columns) {
 		return none, nil, fmt.Errorf(
-			"tuple has more columns than the last RelationMessage: %d > %d. "+
+			"column-count mismatch between tuple and RelationMessage for %s.%s (relid %d): %d != %d. "+
 				"One known occurrence of this was due to a bug with replication column lists in PG 15-15.1. "+
 				"https://www.postgresql.org/message-id/CADGJaX9kiRZ-OH0EpWF5Fkyh1ZZYofoNRCrhapBfdk02tj5EKg@mail.gmail.com",
-			len(tuple.Columns), len(rel.Columns))
+			rel.Namespace, rel.RelationName, rel.RelationID, len(tuple.Columns), len(rel.Columns))
 	}
 
 	for idx, tcol := range tuple.Columns {
 		rcol := rel.Columns[idx]
-		if _, ok := nameAndExclude.Exclude[rcol.Name]; ok {
+		if _, ok := sourceTableMapping.Exclude[rcol.Name]; ok {
 			continue
 		}
-		jsonPassthrough, err := p.shouldPassthroughJSONColumn(nameAndExclude, rcol)
+		jsonPassthrough, err := p.shouldPassthroughJSONColumn(sourceTableMapping, rcol)
 		if err != nil {
 			return none, nil, err
 		}
@@ -521,6 +548,8 @@ func (p *PostgresCDCSource) decodeColumnData(
 	var parsedData any
 	var err error
 
+	dataType, typmod = pkg_pg.ResolveDataType(dataType, typmod, customTypeMapping)
+
 	// Special handling for JSON types to use relaxed number parsing
 	if dataType == pgtype.JSONOID || dataType == pgtype.JSONBOID {
 		var text pgtype.Text
@@ -532,13 +561,22 @@ func (p *PostgresCDCSource) decodeColumnData(
 			if jsonPassthrough {
 				return types.QValueJSON{Val: text.String}, nil
 			}
-			if err := p.jsonApi.UnmarshalFromString(text.String, &parsedData); err != nil {
-				p.logger.Error("[pg_cdc] failed to unmarshal json", slog.Any("error", err))
-				return nil, fmt.Errorf("failed to unmarshal json: %w", err)
-			}
-			if parsedData == nil {
-				// avoid confusing SQL null & JSON null by using pre-marshaled value
-				parsedData = json.RawMessage("null")
+			if p.fastProcessJsonColumns {
+				convertedData, err := convertWithRelaxedNumbers(shared.UnsafeFastStringToReadOnlyBytes(text.String), len(text.String))
+				if err != nil {
+					p.logger.Error("[pg_cdc] failed to process json", slog.Any("error", err))
+					return nil, fmt.Errorf("failed to process json: %w", err)
+				}
+				parsedData = convertedData
+			} else {
+				if err := p.jsonApi.UnmarshalFromString(text.String, &parsedData); err != nil {
+					p.logger.Error("[pg_cdc] failed to unmarshal json", slog.Any("error", err))
+					return nil, fmt.Errorf("failed to unmarshal json: %w", err)
+				}
+				if parsedData == nil {
+					// avoid confusing SQL null & JSON null by using pre-marshaled value
+					parsedData = json.RawMessage("null")
+				}
 			}
 			return p.parseFieldFromPostgresOID(dataType, typmod, true, protos.DBType_DBTYPE_UNKNOWN,
 				parsedData, customTypeMapping, p.internalVersion)
@@ -551,18 +589,37 @@ func (p *PostgresCDCSource) decodeColumnData(
 			return nil, fmt.Errorf("failed to scan json array: %w", err)
 		}
 
-		arr := make([]any, len(textArr))
-		for j, text := range textArr {
-			if text.Valid {
-				if err := p.jsonApi.UnmarshalFromString(text.String, &arr[j]); err != nil {
-					p.logger.Error("[pg_cdc] failed to unmarshal json array element", slog.Any("error", err))
-					return nil, fmt.Errorf("failed to unmarshal json array element: %w", err)
+		if p.fastProcessJsonColumns {
+			arr := make([]preMarshalledJson, len(textArr))
+			for j, text := range textArr {
+				if text.Valid {
+					convertedData, err := convertWithRelaxedNumbers(shared.UnsafeFastStringToReadOnlyBytes(text.String), len(text.String))
+					if err != nil {
+						p.logger.Error("[pg_cdc] failed to process json array element", slog.Any("error", err))
+						return nil, fmt.Errorf("failed to process json array element: %w", err)
+					}
+					arr[j] = convertedData
+				} else {
+					arr[j] = nil
 				}
-			} else {
-				arr[j] = nil
 			}
+			parsedData = arr
+		} else {
+			arr := make([]any, len(textArr))
+			for j, text := range textArr {
+				if text.Valid {
+					if err := p.jsonApi.UnmarshalFromString(text.String, &arr[j]); err != nil {
+						p.logger.Error("[pg_cdc] failed to unmarshal json array element", slog.Any("error", err))
+						return nil, fmt.Errorf("failed to unmarshal json array element: %w", err)
+					}
+				} else {
+					arr[j] = nil
+				}
+			}
+			parsedData = arr
 		}
-		return p.parseFieldFromPostgresOID(dataType, typmod, true, protos.DBType_DBTYPE_UNKNOWN, arr, customTypeMapping, p.internalVersion)
+		return p.parseFieldFromPostgresOID(dataType, typmod, true, protos.DBType_DBTYPE_UNKNOWN,
+			parsedData, customTypeMapping, p.internalVersion)
 	} else if dt, ok := p.typeMap.TypeForOID(dataType); ok {
 		dtOid := dt.OID
 		if dtOid == pgtype.CIDROID || dtOid == pgtype.InetOID || dtOid == pgtype.MacaddrOID || dtOid == pgtype.XMLOID {
@@ -731,9 +788,6 @@ func PullCdcRecords[Items model.Items](
 	pullStart := time.Now()
 	var latestServerWALEnd, lastXLogDataServerWALEnd atomic.Int64
 	defer func() {
-		if totalRecords == 0 {
-			records.SignalAsEmpty()
-		}
 		trace.SpanFromContext(ctx).SetAttributes(
 			attribute.Int64(otel_metrics.RowsInBatchKey, totalRecords),
 			attribute.Int64(otel_metrics.BytesPulledKey, totalFetchedBytes.Load()),
@@ -808,7 +862,6 @@ func PullCdcRecords[Items model.Items](
 		totalRecords++
 
 		if totalRecords == 1 {
-			records.SignalAsNotEmpty()
 			nextRecordDeadline = time.Now().Add(req.IdleTimeout)
 			logger.Info(fmt.Sprintf("pushing the standby deadline to %s", nextRecordDeadline))
 		}
@@ -1216,34 +1269,33 @@ func processMessage[Items model.Items](
 			time.Now().UTC().Add(postgresClockOffset).Sub(msg.CommitTime).Milliseconds())
 		p.commitLock = nil
 	case *pglogrepl.RelationMessage:
-		originalRelID := msg.RelationID
-		var parentRelKind byte
-		// treat all relation messages as corresponding to parent if partitioned.
-		msg.RelationID, parentRelKind, err = p.checkIfUnknownTableInherits(ctx, msg.RelationID)
+		// a child's table and schema mapping is its parent's, but its tuples follow its own column layout,
+		// so the message keeps its own relid and is stored under it
+		mappedRelID, parentRelKind, err := p.checkIfUnknownTableInherits(ctx, msg.RelationID)
 		if err != nil {
 			return nil, err
 		}
 
-		if _, exists := p.srcTableIDNameMapping[msg.RelationID]; !exists {
+		if _, exists := p.srcTableIDNameMapping[mappedRelID]; !exists {
 			return nil, nil
 		}
 
 		// With publish_via_partition_root = true, PG emits a parent RelationMessage
-		// followed by a child RelationMessage for each partition. The parent's
-		// column list matches the tuple data wire format, so skip the child's
-		// to avoid overwriting with a potentially reordered column definition.
-		if originalRelID != msg.RelationID && parentRelKind == 'p' && p.publishViaPartitionRoot {
+		// followed by a child RelationMessage for each partition. Tuples are sent
+		// under the parent's relid in the parent's layout, so the child's message is never used.
+		if msg.RelationID != mappedRelID && parentRelKind == 'p' && p.publishViaPartitionRoot {
 			return nil, nil
 		}
 
 		logger.Info("processing RelationMessage",
 			slog.Any("LSN", currentClientXlogPos),
 			slog.Uint64("RelationID", uint64(msg.RelationID)),
+			slog.Uint64("MappedRelationID", uint64(mappedRelID)),
 			slog.String("Namespace", msg.Namespace),
 			slog.String("RelationName", msg.RelationName),
 			slog.Any("Columns", msg.Columns))
 
-		return processRelationMessage[Items](ctx, p, currentClientXlogPos, msg)
+		return processRelationMessage[Items](ctx, p, currentClientXlogPos, msg, mappedRelID)
 	case *pglogrepl.LogicalDecodingMessage:
 		if p.debugEnabled {
 			logger.Debug("LogicalDecodingMessage",
@@ -1288,9 +1340,9 @@ func processInsertMessage[Items model.Items](
 		p.logger.Debug("InsertMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
 	}
 
-	rel, ok := p.relationMessageMapping[relID]
-	if !ok {
-		return nil, fmt.Errorf("unknown relation id %d for table %s", relID, tableName)
+	rel, err := p.relationMessageFor(msg.RelationID, relID, tableName)
+	if err != nil {
+		return nil, err
 	}
 
 	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
@@ -1347,9 +1399,9 @@ func processUpdateMessage[Items model.Items](
 		}
 	}
 
-	rel, ok := p.relationMessageMapping[relID]
-	if !ok {
-		return nil, fmt.Errorf("unknown relation id %d for table %s", relID, tableName)
+	rel, err := p.relationMessageFor(msg.RelationID, relID, tableName)
+	if err != nil {
+		return nil, err
 	}
 
 	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
@@ -1412,9 +1464,9 @@ func processDeleteMessage[Items model.Items](
 		p.logger.Debug("DeleteMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
 	}
 
-	rel, ok := p.relationMessageMapping[relID]
-	if !ok {
-		return nil, fmt.Errorf("unknown relation id %d for table %s", relID, tableName)
+	rel, err := p.relationMessageFor(msg.RelationID, relID, tableName)
+	if err != nil {
+		return nil, err
 	}
 
 	schemaName, err := p.getSourceSchemaForDestinationColumn(relID, tableName)
@@ -1436,18 +1488,22 @@ func processDeleteMessage[Items model.Items](
 	}, nil
 }
 
-// processRelationMessage processes a RelationMessage and returns a TableSchemaDelta
+// processRelationMessage processes a RelationMessage and returns a TableSchemaDelta.
+// mappedRelID is the mirrored table currRel belongs to: currRel itself, or the parent an inheritance child or
+// partition is remapped to. Table, mapping and schema lookups go through mappedRelID, while the message is
+// stored under its own relid because that is the layout its tuples arrive in.
 func processRelationMessage[Items model.Items](
 	ctx context.Context,
 	p *PostgresCDCSource,
 	lsn pglogrepl.LSN,
 	currRel *pglogrepl.RelationMessage,
+	mappedRelID uint32,
 ) (model.Record[Items], error) {
 	// not present in tables to sync, return immediately
-	currRelName, ok := p.srcTableIDNameMapping[currRel.RelationID]
+	currRelName, ok := p.srcTableIDNameMapping[mappedRelID]
 	if !ok {
 		p.logger.Warn("relid not present in srcTableIDNameMapping, skipping relation message",
-			slog.Uint64("relId", uint64(currRel.RelationID)))
+			slog.Uint64("relId", uint64(mappedRelID)))
 		return nil, nil
 	}
 	customTypeMapping, err := p.fetchCustomTypeMapping(ctx)
@@ -1479,9 +1535,16 @@ func processRelationMessage[Items model.Items](
 	for _, column := range currRel.Columns {
 		switch prevSchema.System {
 		case protos.TypeSystem_Q:
-			qKind := p.postgresOIDToQValueKind(column.DataType, customTypeMapping, p.internalVersion)
+			if _, err := pkg_pg.OIDToName(p.typeMap, column.DataType, customTypeMapping); err != nil {
+				p.logger.Warn("unknown type oid in relation message, cached custom type mapping may be stale",
+					slog.String("tableName", currRelName),
+					slog.String("columnName", column.Name),
+					slog.Uint64("typeOid", uint64(column.DataType)))
+			}
+			dataType, _ := pkg_pg.ResolveDataType(column.DataType, column.TypeModifier, customTypeMapping)
+			qKind := p.postgresOIDToQValueKind(dataType, customTypeMapping, p.internalVersion)
 			if qKind == types.QValueKindInvalid {
-				if typeName, ok := customTypeMapping[column.DataType]; ok {
+				if typeName, ok := customTypeMapping[dataType]; ok {
 					qKind = CustomTypeToQKind(typeName, p.internalVersion)
 				}
 			}
@@ -1498,8 +1561,8 @@ func processRelationMessage[Items model.Items](
 	}
 
 	schemaDelta := &protos.TableSchemaDelta{
-		SrcTableName:    p.srcTableIDNameMapping[currRel.RelationID],
-		DstTableName:    p.tableNameMapping[p.srcTableIDNameMapping[currRel.RelationID]].Name,
+		SrcTableName:    currRelName,
+		DstTableName:    currRelDstInfo.Name,
 		AddedColumns:    nil,
 		System:          prevSchema.System,
 		NullableEnabled: prevSchema.NullableEnabled,
@@ -1510,7 +1573,7 @@ func processRelationMessage[Items model.Items](
 		if inPrevRel {
 			return false
 		}
-		_, isExcluded := p.tableNameMapping[p.srcTableIDNameMapping[currRel.RelationID]].Exclude[columnName]
+		_, isExcluded := currRelDstInfo.Exclude[columnName]
 		return !isExcluded
 	}
 
@@ -1531,7 +1594,9 @@ func processRelationMessage[Items model.Items](
 	// Relation messages carry neither nullability nor the value PostgreSQL returns for rows that
 	// predate an added column, so both come from pg_catalog. A later table rewrite can clear the
 	// missing value before a delayed CDC reader observes this relation message.
-	addedColumnCatalogInfo, err := p.fetchAddedColumnCatalogInfo(ctx, currRel.RelationID, addedColumnNames)
+	// Read from the mirrored table (the parent, for an inheritance child): a column only some children have finds
+	// no row there and is added as nullable without a default, which fits a destination every child writes to.
+	addedColumnCatalogInfo, err := p.fetchAddedColumnCatalogInfo(ctx, mappedRelID, addedColumnNames)
 	if err != nil {
 		return nil, err
 	}
@@ -1540,24 +1605,29 @@ func processRelationMessage[Items model.Items](
 		// not present in previous relation message, but in current one, so added.
 		if isAddedColumnAndNotExcluded(column.Name) {
 			catalogInfo := addedColumnCatalogInfo[column.Name]
+			// json/jsonb take the JSON form of the missing value, which keeps a top-level string quoted
+			qkind := types.QValueKind(currRelMap[column.Name])
+			missingValue := catalogInfo.missingValueFor(qkind)
 			sourceMissingValue := ""
-			if catalogInfo.missingValue != nil {
-				sourceMissingValue = *catalogInfo.missingValue
+			if missingValue != nil {
+				sourceMissingValue = *missingValue
 			}
 			var defaultExpr *string
 			// destinations on the PG type system splice the column type in verbatim, so a literal
 			// rendered for a QValueKind would not fit their DDL
-			if catalogInfo.missingValue != nil && prevSchema.System == protos.TypeSystem_Q {
-				if literal, ok := defaultExprFromPostgresMissingValue(
-					*catalogInfo.missingValue, types.QValueKind(currRelMap[column.Name]),
-				); ok {
+			if missingValue != nil && prevSchema.System == protos.TypeSystem_Q {
+				if literal, ok := defaultExprFromPostgresMissingValue(*missingValue, qkind); ok {
 					defaultExpr = &literal
 				}
+			}
+			typmod := column.TypeModifier
+			if prevSchema.System == protos.TypeSystem_Q {
+				_, typmod = pkg_pg.ResolveDataType(column.DataType, column.TypeModifier, customTypeMapping)
 			}
 			addedColumn := &protos.FieldDescription{
 				Name:           column.Name,
 				Type:           currRelMap[column.Name],
-				TypeModifier:   column.TypeModifier,
+				TypeModifier:   typmod,
 				Nullable:       !catalogInfo.notNull,
 				TypeSchemaName: typeSchemaNameMapping[column.DataType],
 				DefaultExpr:    defaultExpr,
@@ -1601,6 +1671,7 @@ func processRelationMessage[Items model.Items](
 				schemaDelta.SrcTableName))
 		}
 	}
+
 	p.relationMessageMapping[currRel.RelationID] = currRel
 	// only log audit if there is actionable delta
 	if len(schemaDelta.AddedColumns) > 0 {
@@ -1616,8 +1687,20 @@ type addedColumnCatalogInfo struct {
 	// PostgreSQL uses this value when the column is physically absent from a row that predates
 	// ADD COLUMN. nil means either there is no missing value or that value is SQL NULL.
 	missingValue *string
-	hasMissing   bool
-	notNull      bool
+	// missingJSON is the same value as JSON text, which keeps a top-level JSON string quoted and a JSON
+	// null distinct from SQL NULL; only meaningful for json/jsonb columns.
+	missingJSON *string
+	hasMissing  bool
+	notNull     bool
+}
+
+// missingValueFor returns the stored missing value in the form defaultExprFromPostgresMissingValue
+// expects for a column of kind qkind.
+func (info addedColumnCatalogInfo) missingValueFor(qkind types.QValueKind) *string {
+	if qkind == types.QValueKindJSON || qkind == types.QValueKindJSONB {
+		return info.missingJSON
+	}
+	return info.missingValue
 }
 
 // fetchAddedColumnCatalogInfo reads nullability and the value PostgreSQL uses for rows that predate
@@ -1633,9 +1716,11 @@ func (c *PostgresConnector) fetchAddedColumnCatalogInfo(
 	// attmissingval holds the original default value materialized when the column was added, rather
 	// than its current default. It is an anyarray with one element; converting through JSON extracts
 	// that element without having to parse PostgreSQL's array text format. ->> preserves an empty
-	// string while returning SQL NULL for a missing value of NULL.
+	// string while returning SQL NULL for a missing value of NULL. -> keeps the element as JSON text,
+	// which is what a json/jsonb column needs.
 	rows, err := c.conn.Query(ctx, `SELECT a.attname, a.attnotnull, a.atthasmissing,
-		CASE WHEN a.atthasmissing THEN pg_catalog.to_json(a.attmissingval)->>0 END
+		CASE WHEN a.atthasmissing THEN pg_catalog.to_json(a.attmissingval)->>0 END,
+		CASE WHEN a.atthasmissing THEN (pg_catalog.to_json(a.attmissingval)->0)::text END
 		FROM pg_catalog.pg_attribute a
 		WHERE a.attrelid = $1 AND a.attname = ANY($2) AND a.attnum > 0 AND NOT a.attisdropped`,
 		relID, columnNames)
@@ -1647,12 +1732,16 @@ func (c *PostgresConnector) fetchAddedColumnCatalogInfo(
 	var name string
 	var notNull bool
 	var hasMissing bool
-	var missingValue pgtype.Text
-	if _, err := pgx.ForEachRow(rows, []any{&name, &notNull, &hasMissing, &missingValue}, func() error {
+	var missingValue, missingJSON pgtype.Text
+	if _, err := pgx.ForEachRow(rows, []any{&name, &notNull, &hasMissing, &missingValue, &missingJSON}, func() error {
 		info := addedColumnCatalogInfo{hasMissing: hasMissing, notNull: notNull}
 		if missingValue.Valid {
 			value := missingValue.String
 			info.missingValue = &value
+		}
+		if missingJSON.Valid {
+			value := missingJSON.String
+			info.missingJSON = &value
 		}
 		catalogInfo[name] = info
 		return nil
@@ -1760,6 +1849,20 @@ func (p *PostgresCDCSource) getParentRelIDIfPartitioned(relID uint32) uint32 {
 	return relID
 }
 
+// relationMessageFor returns the layout to decode a tuple of relation tupleRelID with, keyed by the tuple's own
+// relid rather than the parent it is remapped to: siblings can order their columns differently, and pgoutput only
+// resends a RelationMessage after the relation's schema changes, so a shared entry would hold whichever sibling
+// was announced last. pgoutput announces every relation before its first tuple, so a missing entry is an error.
+func (p *PostgresCDCSource) relationMessageFor(
+	tupleRelID uint32, mappedRelID uint32, tableName string,
+) (*pglogrepl.RelationMessage, error) {
+	rel, ok := p.relationMessageMapping[tupleRelID]
+	if !ok {
+		return nil, fmt.Errorf("unknown relation id %d (mapped to %d) for table %s", tupleRelID, mappedRelID, tableName)
+	}
+	return rel, nil
+}
+
 // since we generate the childToParent mapping at the beginning of the CDC stream
 // some child tables could be created after the CDC stream starts
 // and we need to check if they inherit from a known table
@@ -1768,26 +1871,26 @@ func (p *PostgresCDCSource) checkIfUnknownTableInherits(ctx context.Context,
 	relID uint32,
 ) (uint32, byte, error) {
 	relID = p.getParentRelIDIfPartitioned(relID)
-	relkinds := "'p'"
-	if p.handleInheritanceForNonPartitionedTables {
-		relkinds = "'p', 'r'"
-	}
 
+	// Relations with no mirrored parent are looked up again on each of their RelationMessages (before their
+	// first change in a session, and after DDL or cache invalidation), as before. Caching the miss across
+	// sessions could hide a later ALTER TABLE ... INHERIT.
 	if _, ok := p.srcTableIDNameMapping[relID]; !ok {
 		var parentRelID uint32
+		var parentRelKind byte
 		if err := p.conn.QueryRow(
 			ctx,
-			fmt.Sprintf(`SELECT inhparent FROM pg_inherits
-			JOIN pg_class c ON pg_inherits.inhparent=c.oid
-			WHERE inhrelid=$1 AND c.relkind IN (%s)`, relkinds),
-			relID,
-		).Scan(&parentRelID); err != nil {
+			inheritedParentQuery(p.handleInheritanceForNonPartitionedTables),
+			relID, p.mirroredRelIDs,
+		).Scan(&parentRelID, &parentRelKind); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return relID, 0, nil
 			}
 			return 0, 0, fmt.Errorf("failed to query pg_inherits: %w", err)
 		}
 		p.childToParentRelIDMapping[relID] = parentRelID
+		// the parent may have had no children when the startup map was built
+		p.idToRelKindMap[parentRelID] = parentRelKind
 		p.hushWarnUnknownTableDetected[relID] = struct{}{}
 		p.logger.Info("Detected new child table in CDC stream, remapping to parent table",
 			slog.Uint64("childRelID", uint64(relID)),

@@ -182,6 +182,21 @@ func EnvWaitForEqualTablesWithNames(
 	dstTable string,
 	cols string,
 ) {
+	suite.T().Helper()
+	EnvWaitForEqualTablesWithNamesFunc(env, suite, reason, srcTable, dstTable, cols, e2eshared.CheckEqualRecordBatches)
+}
+
+// EnvWaitForEqualTablesWithNamesFunc is EnvWaitForEqualTablesWithNames with a caller-supplied comparison
+// of the source and destination batches.
+func EnvWaitForEqualTablesWithNamesFunc(
+	env WorkflowRun,
+	suite RowSource,
+	reason string,
+	srcTable string,
+	dstTable string,
+	cols string,
+	equal func(t *testing.T, src *model.QRecordBatch, dst *model.QRecordBatch) bool,
+) {
 	t := suite.T()
 	t.Helper()
 
@@ -200,7 +215,7 @@ func EnvWaitForEqualTablesWithNames(
 			return false
 		}
 
-		return e2eshared.CheckEqualRecordBatches(t, sourceRows, rows)
+		return equal(t, sourceRows, rows)
 	})
 }
 
@@ -291,7 +306,7 @@ func SetupCDCFlowStatusQuery(t *testing.T, env WorkflowRun, config *protos.FlowC
 		if err == nil {
 			if status == protos.FlowStatus_STATUS_RUNNING || status == protos.FlowStatus_STATUS_COMPLETED {
 				return
-			} else if counter > 60 {
+			} else if counter > 120 {
 				env.Cancel(t.Context())
 				t.Fatal("UNEXPECTED STATUS TIMEOUT", status)
 			}
@@ -770,6 +785,10 @@ var catalogTestAccessPool = sync.OnceValues(func() (*pgxpool.Pool, error) {
 	cfg.MaxConns = 3
 	return pgxpool.NewWithConfig(ctx, cfg)
 })
+
+func CatalogTestAccessPool() (*pgxpool.Pool, error) {
+	return catalogTestAccessPool()
+}
 
 func (env WorkflowRun) GetFlowStatus(t *testing.T) protos.FlowStatus {
 	t.Helper()

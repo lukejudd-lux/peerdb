@@ -18,6 +18,7 @@ import (
 	"go.temporal.io/sdk/log"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc"
 
 	metadataStore "github.com/PeerDB-io/peerdb/flow/connectors/external_metadata"
 	"github.com/PeerDB-io/peerdb/flow/connectors/utils"
@@ -61,13 +62,12 @@ func NewBigQueryServiceAccount(bqConfig *protos.BigqueryConfig) (*utils.GcpServi
 
 //nolint:govet // logically grouped, fieldalignment confuses things
 type BigQueryConnector struct {
-	// droppedExcludeColumns remembers, per source table, excluded columns that
-	// BigQuery has reported as no longer existing, so later polls stop asking BigQuery
-	// to EXCEPT them. Guarded by droppedExcludeColumnsMu since concurrent per-table
-	// pull loops share this connector.
-	droppedExcludeColumnsMu sync.Mutex
-	droppedExcludeColumns   map[string]map[string]struct{}
-	logger                  log.Logger
+	// missingSourceColumns remembers, per source table, mirrored columns that no
+	// longer exist on the source. Populated when pull query fails with column missing.
+	// Guarded by missingSourceColumnsMu since concurrent per-table pull loops share this connector.
+	missingSourceColumnsMu sync.Mutex
+	missingSourceColumns   map[string]map[string]struct{}
+	logger                 log.Logger
 	*metadataStore.PostgresMetadata
 	bqConfig      *protos.BigqueryConfig
 	credentials   *auth.Credentials
@@ -98,12 +98,8 @@ func NewBigQueryConnector(ctx context.Context, config *protos.BigqueryConfig) (*
 		},
 	}
 	var creds *auth.Credentials
-	if credentialConfig.credentialType == credentials.ExternalAccount {
-		creds, err = credentials.NewCredentialsFromJSON(
-			credentials.ExternalAccount,
-			credentialConfig.credentialsJSON,
-			detectOptions,
-		)
+	if credentialConfig.authCredentials != nil {
+		creds = credentialConfig.authCredentials
 	} else {
 		// Keep the legacy service-account-key path unchanged.
 		detectOptions.CredentialsJSON = credentialConfig.credentialsJSON //nolint:staticcheck // Preserve legacy service-account-key behavior.
@@ -113,7 +109,7 @@ func NewBigQueryConnector(ctx context.Context, config *protos.BigqueryConfig) (*
 		return nil, fmt.Errorf("failed to create credentials: %v", err)
 	}
 
-	meteredHTTPClient, err := newMeteredClient(ctx, creds)
+	meteredClient, err := newMeteredClient(ctx, creds)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create metered BigQuery HTTP client: %v", err)
 	}
@@ -121,10 +117,18 @@ func NewBigQueryConnector(ctx context.Context, config *protos.BigqueryConfig) (*
 		ctx,
 		credentialConfig.clientProjectID,
 		option.WithAuthCredentials(creds),
-		option.WithHTTPClient(meteredHTTPClient),
+		option.WithHTTPClient(meteredClient),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create BigQuery client: %v", err)
+	}
+	if err := client.EnableStorageReadClient(
+		ctx,
+		option.WithAuthCredentials(creds),
+		option.WithGRPCDialOption(grpc.WithStatsHandler(&meteredGRPCStatsHandler{})),
+	); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("failed to enable BigQuery Storage Read API: %v", err)
 	}
 
 	if err := validateBigQueryConnection(ctx, client, projectID, datasetID); err != nil {
@@ -143,16 +147,16 @@ func NewBigQueryConnector(ctx context.Context, config *protos.BigqueryConfig) (*
 	}
 
 	return &BigQueryConnector{
-		credentials:           creds,
-		bqConfig:              config,
-		client:                client,
-		datasetID:             datasetID,
-		projectID:             projectID,
-		PostgresMetadata:      metadataStore.NewPostgresMetadataFromCatalog(logger, catalogPool),
-		storageClient:         storageClient,
-		catalogPool:           catalogPool,
-		logger:                logger,
-		droppedExcludeColumns: make(map[string]map[string]struct{}),
+		credentials:          creds,
+		bqConfig:             config,
+		client:               client,
+		datasetID:            datasetID,
+		projectID:            projectID,
+		PostgresMetadata:     metadataStore.NewPostgresMetadataFromCatalog(logger, catalogPool),
+		storageClient:        storageClient,
+		catalogPool:          catalogPool,
+		logger:               logger,
+		missingSourceColumns: make(map[string]map[string]struct{}),
 	}, nil
 }
 

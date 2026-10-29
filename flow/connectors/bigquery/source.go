@@ -5,6 +5,10 @@ import (
 	"errors"
 	"fmt"
 
+	storageapi "cloud.google.com/go/bigquery/storage/apiv1"
+	"google.golang.org/api/option"
+	"google.golang.org/grpc"
+
 	"github.com/PeerDB-io/peerdb/flow/generated/protos"
 	bqvalidate "github.com/PeerDB-io/peerdb/flow/pkg/bigquery"
 	"github.com/PeerDB-io/peerdb/flow/shared/exceptions"
@@ -13,9 +17,25 @@ import (
 func (c *BigQueryConnector) ValidateMirrorSource(ctx context.Context, cfg *protos.FlowConnectionConfigsCore) error {
 	snapshotOnly := cfg.DoInitialSnapshot && cfg.InitialSnapshotOnly
 
+	var storageReadClient *storageapi.BigQueryReadClient
+	if !snapshotOnly {
+		var err error
+		storageReadClient, err = storageapi.NewBigQueryReadClient(
+			ctx,
+			option.WithAuthCredentials(c.credentials),
+			option.WithGRPCConnectionPool(1),
+			option.WithGRPCDialOption(grpc.WithStatsHandler(&meteredGRPCStatsHandler{})),
+		)
+		if err != nil {
+			return fmt.Errorf("failed to create BigQuery Storage Read client: %w", err)
+		}
+		defer storageReadClient.Close()
+	}
+
 	sourceConfig := bqvalidate.SourceConfig{
 		Client:              c.client,
 		StorageClient:       c.storageClient,
+		StorageReadClient:   storageReadClient,
 		ProjectID:           c.projectID,
 		DefaultDataset:      c.datasetID,
 		HasSnapshot:         cfg.DoInitialSnapshot,
@@ -25,9 +45,9 @@ func (c *BigQueryConnector) ValidateMirrorSource(ctx context.Context, cfg *proto
 	if !snapshotOnly {
 		switch cfg.GetBigqueryCdcConfig().GetReplicationMethod() {
 		case protos.BigQueryReplicationMethod_BIGQUERY_REPLICATION_METHOD_QUERY:
-			sourceConfig.ReplicationMode = bqvalidate.ReplicationModeQuery
+			sourceConfig.ReplicationMethod = bqvalidate.ReplicationMethodQuery
 		case protos.BigQueryReplicationMethod_BIGQUERY_REPLICATION_METHOD_EVENTS:
-			sourceConfig.ReplicationMode = bqvalidate.ReplicationModeEvents
+			sourceConfig.ReplicationMethod = bqvalidate.ReplicationMethodEvents
 		default:
 			return fmt.Errorf("invalid replication mode: %v", cfg.GetBigqueryCdcConfig().GetReplicationMethod())
 		}
@@ -43,7 +63,7 @@ func (c *BigQueryConnector) ValidateMirrorSource(ctx context.Context, cfg *proto
 			RequiresOrderingKey: tableMapping.Engine == protos.TableEngine_CH_ENGINE_REPLACING_MERGE_TREE ||
 				tableMapping.Engine == protos.TableEngine_CH_ENGINE_REPLICATED_REPLACING_MERGE_TREE,
 		}
-		if sourceConfig.ReplicationMode == bqvalidate.ReplicationModeEvents {
+		if sourceConfig.ReplicationMethod == bqvalidate.ReplicationMethodEvents {
 			switch tableMapping.GetBigqueryCdcEventsFunction() {
 			case protos.BigqueryCdcEventsFunction_BIGQUERY_CDC_EVENTS_FUNCTION_APPENDS:
 				t.CDCEventsFunction = bqvalidate.CDCEventsFunctionAppends
