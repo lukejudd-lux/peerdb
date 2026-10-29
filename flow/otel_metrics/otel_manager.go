@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -782,12 +783,29 @@ func (om *OtelManager) setupMetrics(ctx context.Context) error {
 	return nil
 }
 
+// otelServiceInstanceID returns a stable identifier unique to this process/pod.
+// It is exported as service.instance.id so that when several replicas push OTLP
+// to a shared collector, the collector's prometheus exporter keeps each replica's
+// cumulative counters as a separate series (distinct `instance` label). Without
+// it, replicas collapse into one series and counter values interleave, which
+// Prometheus reads as constant resets and rate()/increase() grossly over-count.
+func otelServiceInstanceID() string {
+	if podName := internal.GetEnvString("POD_NAME", ""); podName != "" {
+		return podName
+	}
+	if hostname, err := os.Hostname(); err == nil && hostname != "" {
+		return hostname
+	}
+	return ""
+}
+
 // newOtelResource returns a resource describing this application.
 func newOtelResource(otelServiceName string) (*resource.Resource, error) {
 	return resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes("",
 			attribute.Key("service.name").String(otelServiceName),
+			attribute.String("service.instance.id", otelServiceInstanceID()),
 			attribute.String(DeploymentUidKey, internal.PeerDBDeploymentUID()),
 			attribute.Key("service.version").String(internal.PeerDBVersionShaShort()),
 		),

@@ -235,7 +235,7 @@ func TestSSHKeepaliveCDCHang(t *testing.T) {
 		t.Log("SSH keepalive detected failure")
 	case <-pullDone.Chan():
 		t.Fatal("PullRecords exited before SSH keepalive fired — connection closed by something other than keepalive")
-	case <-time.After(3 * utils.SSHKeepaliveInterval):
+	case <-time.After(utils.SSHKeepaliveHungTimeout):
 		t.Fatal("SSH keepalive did not fire in time")
 	}
 

@@ -332,8 +332,9 @@ func (c *PostgresConnector) PullQRepRecords(
 	stream *model.QRecordStream,
 ) (int64, int64, error) {
 	return corePullQRepRecords(c, ctx, config, partition, &RecordStreamSink{
-		QRecordStream:   stream,
-		DestinationType: dstType,
+		QRecordStream:          stream,
+		DestinationType:        dstType,
+		JSONPassthroughColumns: newColumnSet(config.JsonPassthroughColumns),
 	})
 }
 
@@ -546,8 +547,9 @@ func (c *PostgresConnector) PullXminRecordStream(
 	stream *model.QRecordStream,
 ) (int64, int64, int64, error) {
 	return pullXminRecordStream(c, ctx, config, partition, RecordStreamSink{
-		QRecordStream:   stream,
-		DestinationType: dstType,
+		QRecordStream:          stream,
+		DestinationType:        dstType,
+		JSONPassthroughColumns: newColumnSet(config.JsonPassthroughColumns),
 	})
 }
 

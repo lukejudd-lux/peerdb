@@ -149,7 +149,13 @@ func pullAndSyncCore[TPull connectors.CDCPullConnectorCore, TSync connectors.CDC
 			v.DestinationTableIdentifier, v.Exclude, v.StructuredIngestionConfig,
 		)
 		mapping.MongoConfiguration = v.MongoConfig
+		mapping.JSONPassthroughColumns = model.NewStringSet(v.JsonPassthroughColumns)
 		tblNameMapping[v.SourceTableIdentifier] = mapping
+	}
+
+	destinationType, err := connectors.LoadPeerType(ctx, a.CatalogPool, config.DestinationName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load destination peer type: %w", err)
 	}
 
 	if err := srcConn.ConnectionActive(ctx); err != nil {
@@ -246,6 +252,7 @@ func pullAndSyncCore[TPull connectors.CDCPullConnectorCore, TSync connectors.CDC
 			MaxBatchSize:                batchSize,
 			IdleTimeout:                 idleTimeout,
 			TableNameSchemaMapping:      tableNameSchemaMapping,
+			DestinationType:             destinationType,
 			OverridePublicationName:     config.PublicationName,
 			OverrideReplicationSlotName: config.ReplicationSlotName,
 			RecordStream:                recordBatchPull,

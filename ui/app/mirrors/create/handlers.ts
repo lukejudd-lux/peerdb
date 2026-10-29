@@ -198,6 +198,7 @@ function reformattedTableMapping(tableMapping: TableMapRow[]): TableMapping[] {
       queryCdcWatermarkColumn: row.queryCdcWatermarkColumn,
       structuredIngestionConfig: row.structuredIngestionConfig,
       mongoConfig: row.mongoConfig,
+      jsonPassthroughColumns: [],
     }));
 }
 
@@ -237,6 +238,7 @@ export function changesToTablesMapping(
           partitionByExpr: row.partitionByExpr,
           structuredIngestionConfig: row.structuredIngestionConfig,
           mongoConfig: row.mongoConfig,
+          jsonPassthroughColumns: [],
         }) as TableMapping
     );
   return mapping;

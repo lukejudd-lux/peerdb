@@ -4,8 +4,11 @@ import (
 	"testing"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/require"
 
+	"github.com/PeerDB-io/peerdb/flow/generated/protos"
+	"github.com/PeerDB-io/peerdb/flow/internal"
 	"github.com/PeerDB-io/peerdb/flow/model"
 	"github.com/PeerDB-io/peerdb/flow/otel_metrics"
 	"github.com/PeerDB-io/peerdb/flow/shared/types"
@@ -14,8 +17,17 @@ import (
 func newTestCDCSource(t *testing.T) *PostgresCDCSource {
 	t.Helper()
 	return &PostgresCDCSource{
-		PostgresConnector: &PostgresConnector{},
+		PostgresConnector: &PostgresConnector{typeMap: pgtype.NewMap()},
+		jsonApi:           createExtendedJSONUnmarshaler(),
 		otelManager:       &otel_metrics.OtelManager{},
+	}
+}
+
+func cdcTestTableSchema(columnName string, kind types.QValueKind) *protos.TableSchema {
+	return &protos.TableSchema{
+		Columns: []*protos.FieldDescription{
+			{Name: columnName, Type: string(kind)},
+		},
 	}
 }
 
@@ -32,7 +44,8 @@ func TestProcessMessageInvalidMessage(t *testing.T) {
 		WALData: []byte{'S', 0, 1, 0, 1 /*arbitrary bytes*/},
 	}
 
-	rec, err := processMessage(t.Context(), p, batch, xld, xld.WALStart, 0, qProcessor{}, map[string]struct{}{})
+	rec, err := processMessage(t.Context(), p, batch, xld, xld.WALStart, 0, qProcessor{}, map[string]struct{}{},
+		internal.LoggerFromCtx(t.Context()))
 	require.Nil(t, rec)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "error parsing logical message (msgType=\"S\", walStart=0/1)")
@@ -123,6 +136,226 @@ func TestDefaultExprFromPostgresMissingValue(t *testing.T) {
 			literal, ok := defaultExprFromPostgresMissingValue(tc.value, tc.qkind)
 			require.Equal(t, tc.want != "", ok)
 			require.Equal(t, tc.want, literal)
+		})
+	}
+}
+
+func TestCDCDecodeJSONPassthroughPreservesRawNestedJSON(t *testing.T) {
+	t.Parallel()
+
+	p := newTestCDCSource(t)
+	rawJSON := `{"items":[{"n":1000000000000000000000000000000000000000}],"deep":{"array":[1,2,{"ok":true}]}}`
+
+	qvalue, err := p.decodeColumnData(
+		[]byte(rawJSON),
+		pgtype.JSONOID,
+		-1,
+		pgtype.TextFormatCode,
+		nil,
+		0,
+		true,
+	)
+
+	require.NoError(t, err)
+	jsonValue, ok := qvalue.(types.QValueJSON)
+	require.True(t, ok)
+	require.Equal(t, rawJSON, jsonValue.Val)
+	require.False(t, jsonValue.IsArray)
+}
+
+func TestValidateCDCJSONPassthroughConfig(t *testing.T) {
+	t.Parallel()
+
+	tableMapping := map[string]model.SourceTableMapping{
+		"public.events": model.SourceTableMapping{Name: "dataset.events", JSONPassthroughColumns: model.NewStringSet([]string{"payload"})},
+	}
+
+	tests := []struct {
+		name          string
+		destination   protos.DBType
+		schemaMapping map[string]*protos.TableSchema
+		wantErr       string
+	}{
+		{
+			name:        "allows scalar json",
+			destination: protos.DBType_BIGQUERY,
+			schemaMapping: map[string]*protos.TableSchema{
+				"dataset.events": cdcTestTableSchema("payload", types.QValueKindJSON),
+			},
+		},
+		{
+			name:        "allows scalar jsonb",
+			destination: protos.DBType_BIGQUERY,
+			schemaMapping: map[string]*protos.TableSchema{
+				"dataset.events": cdcTestTableSchema("payload", types.QValueKindJSONB),
+			},
+		},
+		{
+			name:        "rejects non BigQuery destination",
+			destination: protos.DBType_POSTGRES,
+			schemaMapping: map[string]*protos.TableSchema{
+				"dataset.events": cdcTestTableSchema("payload", types.QValueKindJSON),
+			},
+			wantErr: "non-BigQuery destination",
+		},
+		{
+			name:        "rejects json array schema",
+			destination: protos.DBType_BIGQUERY,
+			schemaMapping: map[string]*protos.TableSchema{
+				"dataset.events": cdcTestTableSchema("payload", types.QValueKindArrayJSON),
+			},
+			wantErr: "unsupported JSON array type",
+		},
+		{
+			name:        "rejects non JSON schema",
+			destination: protos.DBType_BIGQUERY,
+			schemaMapping: map[string]*protos.TableSchema{
+				"dataset.events": cdcTestTableSchema("payload", types.QValueKindString),
+			},
+			wantErr: "maps to non-JSON destination type",
+		},
+		{
+			name:        "rejects missing column",
+			destination: protos.DBType_BIGQUERY,
+			schemaMapping: map[string]*protos.TableSchema{
+				"dataset.events": cdcTestTableSchema("other_payload", types.QValueKindJSON),
+			},
+			wantErr: "destination column was not found",
+		},
+		{
+			name:          "rejects missing table schema",
+			destination:   protos.DBType_BIGQUERY,
+			schemaMapping: map[string]*protos.TableSchema{},
+			wantErr:       "destination table schema was not found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := validateCDCJSONPassthroughConfig(tt.destination, tableMapping, tt.schemaMapping)
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestShouldPassthroughJSONColumnOIDValidation(t *testing.T) {
+	t.Parallel()
+
+	nameAndExclude := model.SourceTableMapping{Name: "dataset.events", JSONPassthroughColumns: model.NewStringSet([]string{"payload"})}
+
+	tests := []struct {
+		name            string
+		columnName      string
+		oid             uint32
+		wantPassthrough bool
+		wantErr         string
+	}{
+		{
+			name:            "allows json",
+			columnName:      "payload",
+			oid:             pgtype.JSONOID,
+			wantPassthrough: true,
+		},
+		{
+			name:            "allows jsonb",
+			columnName:      "payload",
+			oid:             pgtype.JSONBOID,
+			wantPassthrough: true,
+		},
+		{
+			name:       "rejects json array",
+			columnName: "payload",
+			oid:        pgtype.JSONArrayOID,
+			wantErr:    "unsupported Postgres JSON array type OID",
+		},
+		{
+			name:       "rejects non JSON",
+			columnName: "payload",
+			oid:        pgtype.Int4OID,
+			wantErr:    "non-JSON Postgres type OID",
+		},
+		{
+			name:       "ignores columns outside allowlist",
+			columnName: "other_payload",
+			oid:        pgtype.Int4OID,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := newTestCDCSource(t)
+			p.destinationType = protos.DBType_BIGQUERY
+			p.tableNameSchemaMapping = map[string]*protos.TableSchema{
+				"dataset.events": cdcTestTableSchema("payload", types.QValueKindJSON),
+			}
+
+			passthrough, err := p.shouldPassthroughJSONColumn(nameAndExclude, &pglogrepl.RelationMessageColumn{
+				Name:     tt.columnName,
+				DataType: tt.oid,
+			})
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				require.Equal(t, tt.wantPassthrough, passthrough)
+			} else {
+				require.ErrorContains(t, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestShouldPassthroughJSONColumnDefaultOn covers the default-on path: no column is
+// explicitly listed, so eligibility is decided automatically and ineligible columns
+// must fall back to the normal decode path WITHOUT erroring (so enabling the default
+// globally can never break a mirror).
+func TestShouldPassthroughJSONColumnDefaultOn(t *testing.T) {
+	t.Parallel()
+
+	// Empty allowlist — rely entirely on the default-on behavior.
+	nameAndExclude := model.NewSourceTableMapping("dataset.events", nil)
+
+	tests := []struct {
+		name            string
+		defaultOn       bool
+		destination     protos.DBType
+		oid             uint32
+		destKind        types.QValueKind
+		wantPassthrough bool
+	}{
+		{name: "passes through eligible jsonb", defaultOn: true, destination: protos.DBType_BIGQUERY, oid: pgtype.JSONBOID, destKind: types.QValueKindJSONB, wantPassthrough: true},
+		{name: "passes through eligible json", defaultOn: true, destination: protos.DBType_BIGQUERY, oid: pgtype.JSONOID, destKind: types.QValueKindJSON, wantPassthrough: true},
+		{name: "falls back for json array", defaultOn: true, destination: protos.DBType_BIGQUERY, oid: pgtype.JSONArrayOID, destKind: types.QValueKindJSON, wantPassthrough: false},
+		{name: "falls back for non-json source", defaultOn: true, destination: protos.DBType_BIGQUERY, oid: pgtype.Int4OID, destKind: types.QValueKindJSON, wantPassthrough: false},
+		{name: "falls back when dest column is not json", defaultOn: true, destination: protos.DBType_BIGQUERY, oid: pgtype.JSONBOID, destKind: types.QValueKindString, wantPassthrough: false},
+		{name: "skips non-bigquery destination", defaultOn: true, destination: protos.DBType_CLICKHOUSE, oid: pgtype.JSONBOID, destKind: types.QValueKindJSONB, wantPassthrough: false},
+		{name: "default off never passes through an unlisted column", defaultOn: false, destination: protos.DBType_BIGQUERY, oid: pgtype.JSONBOID, destKind: types.QValueKindJSONB, wantPassthrough: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := newTestCDCSource(t)
+			p.destinationType = tt.destination
+			p.jsonPassthroughDefault = tt.defaultOn
+			p.tableNameSchemaMapping = map[string]*protos.TableSchema{
+				"dataset.events": cdcTestTableSchema("payload", tt.destKind),
+			}
+
+			passthrough, err := p.shouldPassthroughJSONColumn(nameAndExclude, &pglogrepl.RelationMessageColumn{
+				Name:     "payload",
+				DataType: tt.oid,
+			})
+			// Default-on never errors — ineligible columns silently fall back.
+			require.NoError(t, err)
+			require.Equal(t, tt.wantPassthrough, passthrough)
 		})
 	}
 }

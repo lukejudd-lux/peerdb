@@ -19,4 +19,5 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tokio-stream = "0.1"
 tracing.workspace = true
 urlencoding = "2"
+webpki-roots = "1"
 

@@ -68,12 +68,19 @@ type PostgresCDCSource struct {
 	hushWarnUnhandledMessageType             map[pglogrepl.MessageType]struct{}
 	hushWarnUnknownTableDetected             map[uint32]struct{}
 	jsonApi                                  jsoniter.API
+	destinationType                          protos.DBType
 	flowJobName                              string
 	fastProcessJsonColumns                   bool
 	handleInheritanceForNonPartitionedTables bool
 	originMetadataAsDestinationColumn        bool
+	jsonPassthroughDefault                   bool
 	internalVersion                          uint32
 	warnedTypeChanges                        sync.Map
+	// debugEnabled is computed once so the per-record/per-message Debug calls below
+	// can be skipped entirely when debug logging is off. The temporal log.Logger
+	// builds its keyval slice before the level is checked, so an unguarded Debug on
+	// the hot path allocates on every record even when nothing is emitted.
+	debugEnabled bool
 }
 
 type PostgresCDCConfig struct {
@@ -90,6 +97,8 @@ type PostgresCDCConfig struct {
 	HandleInheritanceForNonPartitionedTables bool
 	SourceSchemaAsDestinationColumn          bool
 	OriginMetaAsDestinationColumn            bool
+	JSONPassthroughDefault                   bool
+	DestinationType                          protos.DBType
 	InternalVersion                          uint32
 }
 
@@ -157,6 +166,14 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		}
 	}
 
+	if err := validateCDCJSONPassthroughConfig(
+		cdcConfig.DestinationType,
+		cdcConfig.TableNameMapping,
+		cdcConfig.TableNameSchemaMapping,
+	); err != nil {
+		return nil, err
+	}
+
 	var schemaNameForRelID map[uint32]string
 	if cdcConfig.SourceSchemaAsDestinationColumn {
 		schemaNameForRelID = make(map[uint32]string, len(cdcConfig.TableNameSchemaMapping))
@@ -184,11 +201,14 @@ func (c *PostgresConnector) NewPostgresCDCSource(ctx context.Context, cdcConfig 
 		hushWarnUnhandledMessageType:             make(map[pglogrepl.MessageType]struct{}),
 		hushWarnUnknownTableDetected:             make(map[uint32]struct{}),
 		jsonApi:                                  jsonApi,
+		destinationType:                          cdcConfig.DestinationType,
 		flowJobName:                              cdcConfig.FlowJobName,
 		fastProcessJsonColumns:                   cdcConfig.FastProcessJsonColumns,
 		handleInheritanceForNonPartitionedTables: cdcConfig.HandleInheritanceForNonPartitionedTables,
 		originMetadataAsDestinationColumn:        cdcConfig.OriginMetaAsDestinationColumn,
+		jsonPassthroughDefault:                   cdcConfig.JSONPassthroughDefault,
 		internalVersion:                          cdcConfig.InternalVersion,
+		debugEnabled:                             slog.Default().Enabled(ctx, slog.LevelDebug),
 	}, nil
 }
 
@@ -272,6 +292,7 @@ type replProcessor[Items model.Items] interface {
 		tuple *pglogrepl.TupleDataColumn,
 		col *pglogrepl.RelationMessageColumn,
 		customTypeMapping map[uint32]pkg_pg.CustomDataType,
+		jsonPassthrough bool,
 	) error
 
 	AddStringColumn(items Items, name string, value string)
@@ -289,6 +310,7 @@ func (pgProcessor) Process(
 	tuple *pglogrepl.TupleDataColumn,
 	col *pglogrepl.RelationMessageColumn,
 	customTypeMapping map[uint32]pkg_pg.CustomDataType,
+	_ bool,
 ) error {
 	switch tuple.DataType {
 	case 'n': // null
@@ -324,6 +346,7 @@ func (qProcessor) Process(
 	tuple *pglogrepl.TupleDataColumn,
 	col *pglogrepl.RelationMessageColumn,
 	customTypeMapping map[uint32]pkg_pg.CustomDataType,
+	jsonPassthrough bool,
 ) error {
 	switch tuple.DataType {
 	case 'n': // null
@@ -332,6 +355,7 @@ func (qProcessor) Process(
 		// bytea also appears here as a hex
 		data, err := p.decodeColumnData(
 			tuple.Data, col.DataType, col.TypeModifier, pgtype.TextFormatCode, customTypeMapping, p.internalVersion,
+			jsonPassthrough,
 		)
 		if err != nil {
 			p.logger.Error("error decoding text column data", slog.Any("error", err),
@@ -342,6 +366,7 @@ func (qProcessor) Process(
 	case 'b': // binary
 		data, err := p.decodeColumnData(
 			tuple.Data, col.DataType, col.TypeModifier, pgtype.BinaryFormatCode, customTypeMapping, p.internalVersion,
+			jsonPassthrough,
 		)
 		if err != nil {
 			return fmt.Errorf("error decoding binary data for column %s: %w", col.Name, err)
@@ -355,6 +380,106 @@ func (qProcessor) Process(
 
 func (qProcessor) AddStringColumn(items model.RecordItems, name string, value string) {
 	items.AddColumn(name, types.QValueString{Val: value})
+}
+
+func validateJSONPassthroughTableSchema(tableSchema *protos.TableSchema, tableName string, columnName string) error {
+	if tableSchema == nil {
+		return fmt.Errorf("json passthrough column %s.%s configured but destination table schema was not found",
+			tableName, columnName)
+	}
+
+	for _, column := range tableSchema.Columns {
+		if column.Name != columnName {
+			continue
+		}
+		switch types.QValueKind(column.Type) {
+		case types.QValueKindJSON, types.QValueKindJSONB:
+			return nil
+		case types.QValueKindArrayJSON, types.QValueKindArrayJSONB:
+			return fmt.Errorf("json passthrough column %s.%s has unsupported JSON array type %s",
+				tableName, columnName, column.Type)
+		default:
+			return fmt.Errorf("json passthrough column %s.%s maps to non-JSON destination type %s",
+				tableName, columnName, column.Type)
+		}
+	}
+
+	return fmt.Errorf("json passthrough column %s.%s configured but destination column was not found",
+		tableName, columnName)
+}
+
+func validateCDCJSONPassthroughConfig(
+	destinationType protos.DBType,
+	tableNameMapping map[string]model.SourceTableMapping,
+	tableNameSchemaMapping map[string]*protos.TableSchema,
+) error {
+	for sourceTableName, nameAndExclude := range tableNameMapping {
+		if len(nameAndExclude.JSONPassthroughColumns) == 0 {
+			continue
+		}
+		if destinationType != protos.DBType_BIGQUERY {
+			return fmt.Errorf("json passthrough columns configured for source table %s with non-BigQuery destination %s",
+				sourceTableName, destinationType)
+		}
+
+		for columnName := range nameAndExclude.JSONPassthroughColumns {
+			if err := validateJSONPassthroughTableSchema(
+				tableNameSchemaMapping[nameAndExclude.Name], nameAndExclude.Name, columnName,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (p *PostgresCDCSource) shouldPassthroughJSONColumn(
+	nameAndExclude model.SourceTableMapping,
+	col *pglogrepl.RelationMessageColumn,
+) (bool, error) {
+	_, explicit := nameAndExclude.JSONPassthroughColumns[col.Name]
+	// A column explicitly listed in json_passthrough_columns is validated strictly
+	// (misconfiguration is a hard error). Otherwise, when the default is enabled, we
+	// attempt passthrough for every eligible column and silently fall back to the
+	// normal decode/re-marshal path for anything ineligible, so enabling it globally
+	// can never break a mirror.
+	if !explicit && !p.jsonPassthroughDefault {
+		return false, nil
+	}
+
+	if p.destinationType != protos.DBType_BIGQUERY {
+		if explicit {
+			return false, fmt.Errorf("json passthrough column %s.%s configured for non-BigQuery destination %s",
+				nameAndExclude.Name, col.Name, p.destinationType)
+		}
+		return false, nil
+	}
+
+	switch col.DataType {
+	case pgtype.JSONOID, pgtype.JSONBOID:
+	case pgtype.JSONArrayOID, pgtype.JSONBArrayOID:
+		if explicit {
+			return false, fmt.Errorf("json passthrough column %s.%s has unsupported Postgres JSON array type OID %d",
+				nameAndExclude.Name, col.Name, col.DataType)
+		}
+		return false, nil
+	default:
+		if explicit {
+			return false, fmt.Errorf("json passthrough column %s.%s has non-JSON Postgres type OID %d",
+				nameAndExclude.Name, col.Name, col.DataType)
+		}
+		return false, nil
+	}
+
+	if err := validateJSONPassthroughTableSchema(
+		p.tableNameSchemaMapping[nameAndExclude.Name], nameAndExclude.Name, col.Name,
+	); err != nil {
+		if explicit {
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
 }
 
 func processTuple[Items model.Items](
@@ -391,12 +516,16 @@ func processTuple[Items model.Items](
 		if _, ok := sourceTableMapping.Exclude[rcol.Name]; ok {
 			continue
 		}
+		jsonPassthrough, err := p.shouldPassthroughJSONColumn(sourceTableMapping, rcol)
+		if err != nil {
+			return none, nil, err
+		}
 		if tcol.DataType == 'u' {
 			if unchangedToastColumns == nil {
 				unchangedToastColumns = make(map[string]struct{})
 			}
 			unchangedToastColumns[rcol.Name] = struct{}{}
-		} else if err := processor.Process(items, p, tcol, rcol, customTypeMapping); err != nil {
+		} else if err := processor.Process(items, p, tcol, rcol, customTypeMapping, jsonPassthrough); err != nil {
 			return none, nil, err
 		}
 	}
@@ -414,6 +543,7 @@ func processTuple[Items model.Items](
 
 func (p *PostgresCDCSource) decodeColumnData(
 	data []byte, dataType uint32, typmod int32, formatCode int16, customTypeMapping map[uint32]pkg_pg.CustomDataType, version uint32,
+	jsonPassthrough bool,
 ) (types.QValue, error) {
 	var parsedData any
 	var err error
@@ -428,6 +558,9 @@ func (p *PostgresCDCSource) decodeColumnData(
 			return nil, fmt.Errorf("failed to scan json: %w", err)
 		}
 		if text.Valid {
+			if jsonPassthrough {
+				return types.QValueJSON{Val: text.String}, nil
+			}
 			if p.fastProcessJsonColumns {
 				convertedData, err := convertWithRelaxedNumbers(shared.UnsafeFastStringToReadOnlyBytes(text.String), len(text.String))
 				if err != nil {
@@ -614,17 +747,24 @@ func PullCdcRecords[Items model.Items](
 		messageWaitPeriod = min(req.IdleTimeout, clientSidePingPeriod(p.walSenderTimeout.duration))
 	}
 
-	logger.Debug("Message wait period determined",
-		slog.Duration("messageWaitPeriod", messageWaitPeriod),
-		slog.Duration("wal_sender_timeout", p.walSenderTimeout.duration),
-		slog.Duration("req.IdleTimeout", req.IdleTimeout),
-	)
+	if p.debugEnabled {
+		logger.Debug("Message wait period determined",
+			slog.Duration("messageWaitPeriod", messageWaitPeriod),
+			slog.Duration("wal_sender_timeout", p.walSenderTimeout.duration),
+			slog.Duration("req.IdleTimeout", req.IdleTimeout),
+		)
+	}
 
 	records := req.RecordStream
 	warnedReplIdentTables := make(map[string]struct{})
 	var totalRecords int64
 	var fetchedBytes, totalFetchedBytes, allFetchedBytes atomic.Int64
 	var receiveTime, processTime, addRecordTime atomic.Int64
+	// Accumulate unchanged-toast counts and flush them with the periodic metrics
+	// below instead of recording a metric on every update record.
+	var unchangedToastBackfilled, unchangedToastNotBackfilled atomic.Int64
+	backfilledTrue := metric.WithAttributeSet(attribute.NewSet(attribute.Bool("backfilled", true)))
+	backfilledFalse := metric.WithAttributeSet(attribute.NewSet(attribute.Bool("backfilled", false)))
 	var processStart time.Time
 	// clientXLogPos is the last checkpoint id, we need to ack that we have processed
 	// until clientXLogPos each time we send a standby status update.
@@ -674,6 +814,8 @@ func PullCdcRecords[Items model.Items](
 		p.otelManager.Metrics.CDCReceiveTimeCounter.Add(ctx, receiveTime.Swap(0))
 		p.otelManager.Metrics.CDCProcessTimeCounter.Add(ctx, processTime.Swap(0))
 		p.otelManager.Metrics.CDCAddRecordTimeCounter.Add(ctx, addRecordTime.Swap(0))
+		p.otelManager.Metrics.UnchangedToastValuesCounter.Add(ctx, unchangedToastBackfilled.Swap(0), backfilledTrue)
+		p.otelManager.Metrics.UnchangedToastValuesCounter.Add(ctx, unchangedToastNotBackfilled.Swap(0), backfilledFalse)
 	}()
 	shutdown := common.Interval(ctx, time.Minute, func() {
 		p.otelManager.Metrics.FetchedBytesCounter.Add(ctx, fetchedBytes.Swap(0))
@@ -681,6 +823,8 @@ func PullCdcRecords[Items model.Items](
 		p.otelManager.Metrics.CDCReceiveTimeCounter.Add(ctx, receiveTime.Swap(0))
 		p.otelManager.Metrics.CDCProcessTimeCounter.Add(ctx, processTime.Swap(0))
 		p.otelManager.Metrics.CDCAddRecordTimeCounter.Add(ctx, addRecordTime.Swap(0))
+		p.otelManager.Metrics.UnchangedToastValuesCounter.Add(ctx, unchangedToastBackfilled.Swap(0), backfilledTrue)
+		p.otelManager.Metrics.UnchangedToastValuesCounter.Add(ctx, unchangedToastNotBackfilled.Swap(0), backfilledFalse)
 
 		if lastXLogDataServerWALEnd.Load() > 0 {
 			p.otelManager.Metrics.ServerWalEndLagGauge.Record(ctx,
@@ -895,10 +1039,12 @@ func PullCdcRecords[Items model.Items](
 					lastXLogDataServerWALEnd.Store(int64(xld.ServerWALEnd))
 				}
 
-				logger.Debug("XLogData",
-					slog.Any("WALStart", xld.WALStart), slog.Any("ServerWALEnd", xld.ServerWALEnd), slog.Time("ServerTime", xld.ServerTime))
+				if p.debugEnabled {
+					logger.Debug("XLogData",
+						slog.Any("WALStart", xld.WALStart), slog.Any("ServerWALEnd", xld.ServerWALEnd), slog.Time("ServerTime", xld.ServerTime))
+				}
 				rec, err := processMessage(ctx, p, records, xld, clientXLogPos, postgresClockOffset,
-					processor, warnedReplIdentTables)
+					processor, warnedReplIdentTables, logger)
 				if err != nil {
 					return exceptions.NewPostgresLogicalMessageProcessingError(err)
 				}
@@ -942,14 +1088,10 @@ func PullCdcRecords[Items model.Items](
 									for _, col := range updatedCols {
 										delete(r.UnchangedToastColumns, col)
 									}
-									p.otelManager.Metrics.UnchangedToastValuesCounter.Add(ctx, int64(len(updatedCols)),
-										metric.WithAttributeSet(attribute.NewSet(
-											attribute.Bool("backfilled", true))))
+									unchangedToastBackfilled.Add(int64(len(updatedCols)))
 								}
 							}
-							p.otelManager.Metrics.UnchangedToastValuesCounter.Add(ctx, int64(len(r.UnchangedToastColumns)),
-								metric.WithAttributeSet(attribute.NewSet(
-									attribute.Bool("backfilled", false))))
+							unchangedToastNotBackfilled.Add(int64(len(r.UnchangedToastColumns)))
 
 							if err := addRecordWithKey(tablePkeyVal, rec); err != nil {
 								return err
@@ -1085,8 +1227,8 @@ func processMessage[Items model.Items](
 	postgresClockOffset time.Duration,
 	processor replProcessor[Items],
 	warnedReplIdentTables map[string]struct{},
+	logger log.Logger,
 ) (model.Record[Items], error) {
-	logger := internal.LoggerFromCtx(ctx)
 	logicalMsg, err := pglogrepl.Parse(xld.WALData)
 	if err != nil {
 		var msgType string
@@ -1102,7 +1244,9 @@ func processMessage[Items model.Items](
 
 	switch msg := logicalMsg.(type) {
 	case *pglogrepl.BeginMessage:
-		logger.Debug("BeginMessage", slog.Any("FinalLSN", msg.FinalLSN), slog.Uint64("XID", uint64(msg.Xid)))
+		if p.debugEnabled {
+			logger.Debug("BeginMessage", slog.Any("FinalLSN", msg.FinalLSN), slog.Uint64("XID", uint64(msg.Xid)))
+		}
 		p.otelManager.Metrics.SourceLagGauge.Record(ctx,
 			time.Now().UTC().Add(postgresClockOffset).Sub(msg.CommitTime).Milliseconds())
 		p.commitLock = msg
@@ -1114,9 +1258,11 @@ func processMessage[Items model.Items](
 		return processDeleteMessage(p, xld.WALStart, msg, processor, customTypeMapping)
 	case *pglogrepl.CommitMessage:
 		// for a commit message, update the last checkpoint id for the record batch.
-		logger.Debug("CommitMessage",
-			slog.Any("CommitLSN", msg.CommitLSN),
-			slog.Any("TransactionEndLSN", msg.TransactionEndLSN))
+		if p.debugEnabled {
+			logger.Debug("CommitMessage",
+				slog.Any("CommitLSN", msg.CommitLSN),
+				slog.Any("TransactionEndLSN", msg.TransactionEndLSN))
+		}
 		batch.UpdateLatestCheckpointID(int64(msg.CommitLSN))
 		p.otelManager.Metrics.ReceivedCommitLSNGauge.Record(ctx, int64(msg.CommitLSN))
 		p.otelManager.Metrics.SourceLagGauge.Record(ctx,
@@ -1151,10 +1297,12 @@ func processMessage[Items model.Items](
 
 		return processRelationMessage[Items](ctx, p, currentClientXlogPos, msg, mappedRelID)
 	case *pglogrepl.LogicalDecodingMessage:
-		logger.Debug("LogicalDecodingMessage",
-			slog.Bool("Transactional", msg.Transactional),
-			slog.String("Prefix", msg.Prefix),
-			slog.String("LSN", msg.LSN.String()))
+		if p.debugEnabled {
+			logger.Debug("LogicalDecodingMessage",
+				slog.Bool("Transactional", msg.Transactional),
+				slog.String("Prefix", msg.Prefix),
+				slog.String("LSN", msg.LSN.String()))
+		}
 		if !msg.Transactional {
 			batch.UpdateLatestCheckpointID(int64(msg.LSN))
 		}
@@ -1188,7 +1336,9 @@ func processInsertMessage[Items model.Items](
 	}
 
 	// log lsn and relation id for debugging
-	p.logger.Debug("InsertMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	if p.debugEnabled {
+		p.logger.Debug("InsertMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	}
 
 	rel, err := p.relationMessageFor(msg.RelationID, relID, tableName)
 	if err != nil {
@@ -1231,7 +1381,9 @@ func processUpdateMessage[Items model.Items](
 	}
 
 	// log lsn and relation id for debugging
-	p.logger.Debug("UpdateMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	if p.debugEnabled {
+		p.logger.Debug("UpdateMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	}
 
 	// By default, replica identity is the same as source PK/destination ordering key,
 	// so when it changes the destination can see duplicates or missed deletes.
@@ -1308,7 +1460,9 @@ func processDeleteMessage[Items model.Items](
 	}
 
 	// log lsn and relation id for debugging
-	p.logger.Debug("DeleteMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	if p.debugEnabled {
+		p.logger.Debug("DeleteMessage", slog.Any("LSN", lsn), slog.Uint64("RelationID", uint64(relID)), slog.String("Relation Name", tableName))
+	}
 
 	rel, err := p.relationMessageFor(msg.RelationID, relID, tableName)
 	if err != nil {

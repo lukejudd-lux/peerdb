@@ -62,6 +62,10 @@ message TableMapping {
 
   // MongoDB specific settings of the table, only meaningful when the source is MongoDB.
   MongoTableConfig mongo_config = 13;
+
+  // Lux fork: json/jsonb columns passed through to BigQuery as raw text. Numbered well clear of
+  // upstream's fields (this was field 12 before v0.37.14-lux, which upstream now uses).
+  repeated string json_passthrough_columns = 1001;
 }
 
 message MongoTableConfig {
@@ -530,6 +534,10 @@ message QRepConfig {
   bool add_null_partition = 32; // internal
   // Structured ingestion settings of the replicated table, unset for tables that do not use it.
   StructuredIngestionTableConfig structured_ingestion_config = 33;
+
+  // Lux fork: json/jsonb columns passed through to BigQuery as raw text. Numbered well clear of
+  // upstream's fields (this was field 33 before v0.37.14-lux, which upstream now uses).
+  repeated string json_passthrough_columns = 1001;
 }
 
 message ChildTableRange {

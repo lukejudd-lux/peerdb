@@ -112,9 +112,15 @@ func recordToQRecordOrError(
 		if err != nil {
 			return nil, fmt.Errorf("failed to serialize update record new items to JSON: %w", err)
 		}
-		oldItemsJSON, err := typedRecord.OldItems.ToJSONWithOptions(jsonOpts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to serialize update record old items to JSON: %w", err)
+		// _peerdb_match_data carries the old row and is only consumed by ClickHouse's
+		// primary-key-update path. BigQuery stores the column but never reads it, so skip
+		// the extra old-items serialization (and the allocations it drives) for BigQuery.
+		oldItemsJSON := ""
+		if targetDWH != protos.DBType_BIGQUERY {
+			oldItemsJSON, err = typedRecord.OldItems.ToJSONWithOptions(jsonOpts)
+			if err != nil {
+				return nil, fmt.Errorf("failed to serialize update record old items to JSON: %w", err)
+			}
 		}
 
 		entries[3] = types.QValueString{Val: newItemsJSON}

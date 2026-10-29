@@ -487,6 +487,9 @@ func (c *PostgresConnector) parseFieldFromPostgresOID(
 		boolVal := value.(bool)
 		return types.QValueBoolean{Val: boolVal}, nil
 	case types.QValueKindJSON, types.QValueKindJSONB:
+		if jsonVal, ok := value.(types.QValueJSON); ok {
+			return jsonVal, nil
+		}
 		if preMarshalled, ok := value.(preMarshalledJson); ok {
 			return types.QValueJSON{Val: string(preMarshalled), IsArray: false}, nil
 		}

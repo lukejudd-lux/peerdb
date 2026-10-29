@@ -20,7 +20,21 @@ type SourceTableMapping struct {
 	// MongoConfiguration is the table's MongoDB specific settings, nil when it has none.
 	MongoConfiguration *protos.MongoTableConfig
 	Exclude            map[string]struct{}
-	Name               string
+	// JSONPassthroughColumns are json/jsonb columns passed through as raw text (BigQuery only).
+	JSONPassthroughColumns map[string]struct{}
+	Name                   string
+}
+
+// NewStringSet returns values as a set, nil when there are none.
+func NewStringSet(values []string) map[string]struct{} {
+	if len(values) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
 }
 
 func NewSourceTableMapping(name string, exclude []string) SourceTableMapping {
@@ -89,6 +103,8 @@ type PullRecordsRequest[T Items] struct {
 	TableNameMapping map[string]SourceTableMapping
 	// tablename to schema mapping
 	TableNameSchemaMapping map[string]*protos.TableSchema
+	// DestinationType is the destination peer type for destination-specific source decoding.
+	DestinationType protos.DBType
 	// overrides dynamic configuration
 	Env map[string]string
 	// override publication name
