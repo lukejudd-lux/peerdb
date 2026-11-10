@@ -460,6 +460,8 @@ func setWorkflowQueries(ctx workflow.Context, state *protos.QRepFlowState) error
 	return nil
 }
 
+const qrepWaitBeforeFirstCheckChangeID = "lux-qrep-wait-before-first-check"
+
 func QRepWaitForNewRowsWorkflow(ctx workflow.Context, config *protos.QRepConfig, lastPartition *protos.QRepPartition) error {
 	logger := log.With(workflow.GetLogger(ctx), slog.String(string(shared.FlowNameKey), config.FlowJobName))
 
@@ -475,21 +477,34 @@ func QRepWaitForNewRowsWorkflow(ctx workflow.Context, config *protos.QRepConfig,
 		},
 	})
 
+	waitBetweenBatches := 5 * time.Second
+	if config.WaitBetweenBatchesSeconds > 0 {
+		waitBetweenBatches = time.Duration(config.WaitBetweenBatchesSeconds) * time.Second
+	}
+
+	optedForOverwrite := config.WriteMode.WriteType == protos.QRepWriteType_QREP_WRITE_MODE_OVERWRITE
+
+	// Wait once before the first check, so the wait is also the minimum time between runs.
+	// Without it a source that changes continuously starts a new run (and a new set of
+	// workflows) every few seconds, whatever the wait is set to. Continued runs of this
+	// workflow have already slept below. Overwrite mirrors are left alone (a full refresh
+	// already sleeps on every pass). Versioned so histories recorded before this replay.
+	if workflow.GetVersion(ctx, qrepWaitBeforeFirstCheckChangeID, workflow.DefaultVersion, 1) == 1 &&
+		!optedForOverwrite && workflow.GetInfo(ctx).ContinuedExecutionRunID == "" {
+		if sleepErr := workflow.Sleep(ctx, waitBetweenBatches); sleepErr != nil {
+			return sleepErr
+		}
+	}
+
 	var hasNewRows bool
 	err := workflow.ExecuteActivity(ctx, flowable.QRepHasNewRows, config, lastPartition).Get(ctx, &hasNewRows)
 	if err != nil {
 		return fmt.Errorf("error checking for new rows: %w", err)
 	}
 
-	optedForOverwrite := config.WriteMode.WriteType == protos.QRepWriteType_QREP_WRITE_MODE_OVERWRITE
 	fullRefresh := optedForOverwrite && getQRepOverwriteFullRefreshMode(ctx, logger, config.Env)
 	// If no new rows are found, continue as new
 	if !hasNewRows || fullRefresh {
-		waitBetweenBatches := 5 * time.Second
-		if config.WaitBetweenBatchesSeconds > 0 {
-			waitBetweenBatches = time.Duration(config.WaitBetweenBatchesSeconds) * time.Second
-		}
-
 		if sleepErr := workflow.Sleep(ctx, waitBetweenBatches); sleepErr != nil {
 			return sleepErr
 		}
